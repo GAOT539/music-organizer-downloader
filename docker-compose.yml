@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   music-organizer-downloader:
     build: .
@@ -8,7 +6,11 @@ services:
       - "8501:8501"
     volumes:
       - ./data:/app/data
-      - ./music_export:/app/output
+      # Las descargas van a HOST_DOWNLOAD_DIR (del .env). Si Docker no tiene
+      # permiso a esa ruta, cambia HOST_DOWNLOAD_DIR=./music_export en el .env.
+      - ${HOST_DOWNLOAD_DIR:-./music_export}:/app/music_export
       - ./app.py:/app/app.py
       - ./logo.png:/app/logo.png
     restart: unless-stopped
+    env_file:
+      - .env
