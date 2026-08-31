@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  music-organizer-downloader:
+    build: .
+    container_name: music_organizer_downloader_app
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./music_export:/app/output
+      - ./app.py:/app/app.py
+      - ./logo.png:/app/logo.png
+    restart: unless-stopped

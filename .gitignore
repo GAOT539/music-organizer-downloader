@@ -1,0 +1,16 @@
+# Variables de entorno (contienen rutas locales y posibles secrets)
+.env
+
+# Carpeta de descargas del proyecto (si se usa ruta relativa)
+music_export/
+
+# Datos locales
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Docker
+*.log
