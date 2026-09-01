@@ -44,6 +44,9 @@ BASE_OUTPUT_DIR = os.path.join(
 )
 os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
 
+# --- REGISTRO PERSISTENTE EN DISCO ---
+LOG_FILE_PATH = os.path.join(BASE_OUTPUT_DIR, "registro_descargas.txt")
+
 # --- INICIALIZACIÓN DE ESTADO DE DESCARGA EN SESSION_STATE ---
 if "download_state" not in st.session_state:
     st.session_state["download_state"] = {
@@ -300,6 +303,12 @@ def run_download_job(df_sorted, root_target_dir, engine_mode, env_vars):
             update_console(f"✔ Omitido (Ya existe): {base_filename}")
             state["success_count"] += 1
             state["progress"] = current_num / total_tracks
+            # --- Registro persistente: canción omitida ---
+            try:
+                with open(LOG_FILE_PATH, 'a', encoding='utf-8') as _lf:
+                    _lf.write(f"OMITIDO | {base_filename}\n")
+            except Exception:
+                pass
             continue
 
         success = False
@@ -685,12 +694,26 @@ def run_download_job(df_sorted, root_target_dir, engine_mode, env_vars):
 
         if success:
             state["success_count"] += 1
-            update_console(f"\u2714 EXITOSO: {base_filename}.mp3")
+            update_console(f"✔ EXITOSO: {base_filename}.mp3")
+            # --- Registro persistente: éxito ---
+            try:
+                with open(LOG_FILE_PATH, 'a', encoding='utf-8') as _lf:
+                    _lf.write(f"ÉXITO | {base_filename}\n")
+            except Exception:
+                pass
         else:
-            update_console(f"\u2716 ERROR: {base_filename} -- {reason}")
+            update_console(f"✖ ERROR: {base_filename} -- {reason}")
             song_dict = row.to_dict()
             song_dict['Error_Reason'] = reason
             state["failed_songs"].append(song_dict)
+            # --- Registro persistente: error ---
+            # Extraer solo la primera línea / frase corta del motivo
+            _short_reason = str(reason).split('\n')[0][:120]
+            try:
+                with open(LOG_FILE_PATH, 'a', encoding='utf-8') as _lf:
+                    _lf.write(f"ERROR | {base_filename} | {_short_reason}\n")
+            except Exception:
+                pass
 
         state["progress"] = current_num / total_tracks
 
@@ -982,6 +1005,86 @@ elif menu_selection == "downloads":
         ">{escaped_lines}</div>
         """
         st.html(console_html)
+
+        # ------------------------------------------------------------------ #
+        # PANEL DE REGISTRO DE RESULTADOS CON FILTROS                         #
+        # ------------------------------------------------------------------ #
+        with st.container():
+            st.markdown("#### 📑 Registro de Resultados")
+
+            _filter_col, _spacer = st.columns([2, 5])
+            with _filter_col:
+                log_filter = st.radio(
+                    "Filtrar por estado:",
+                    options=["Errores", "Éxitos", "Omitidos", "Todos"],
+                    index=0,
+                    horizontal=True,
+                    key="log_filter_radio",
+                    label_visibility="collapsed",
+                )
+
+            def _render_log_table(filter_choice: str):
+                """Lee registro_descargas.txt, filtra y renderiza un dataframe."""
+                if not os.path.exists(LOG_FILE_PATH):
+                    st.info("Aún no hay entradas en el registro. Inicia una descarga para comenzar.")
+                    return
+
+                prefix_map = {
+                    "Errores":  "ERROR",
+                    "Éxitos":   "ÉXITO",
+                    "Omitidos": "OMITIDO",
+                    "Todos":    None,
+                }
+                target_prefix = prefix_map.get(filter_choice)
+
+                rows = []
+                try:
+                    with open(LOG_FILE_PATH, 'r', encoding='utf-8') as _lf:
+                        for raw_line in _lf:
+                            line = raw_line.strip()
+                            if not line:
+                                continue
+                            parts = [p.strip() for p in line.split('|')]
+                            estado  = parts[0] if len(parts) > 0 else ""
+                            cancion = parts[1] if len(parts) > 1 else ""
+                            detalle = parts[2] if len(parts) > 2 else ""
+                            if target_prefix is None or estado.upper().startswith(target_prefix.upper()):
+                                rows.append({"Estado": estado, "Canción": cancion, "Detalle / Error": detalle})
+                except Exception as _read_err:
+                    st.warning(f"No se pudo leer el registro: {_read_err}")
+                    return
+
+                if not rows:
+                    st.info(f"Sin resultados para el filtro **{filter_choice}**.")
+                    return
+
+                _df_log = pd.DataFrame(rows)
+
+                # Colorear la columna Estado con estilos CSS según tipo
+                def _style_estado(val):
+                    color_map = {
+                        "ÉXITO":   "color: #3fb950; font-weight: 600;",
+                        "ERROR":   "color: #f85149; font-weight: 600;",
+                        "OMITIDO": "color: #d29922; font-weight: 600;",
+                    }
+                    for key, style in color_map.items():
+                        if val.upper().startswith(key):
+                            return style
+                    return ""
+
+                styled = _df_log.style.map(_style_estado, subset=["Estado"])
+                st.dataframe(
+                    styled,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(400, 35 * len(rows) + 38),
+                )
+                st.caption(
+                    f"📁 Registro guardado en: `{LOG_FILE_PATH}` — "
+                    f"{len(rows)} entradas mostradas"
+                )
+
+            _render_log_table(log_filter)
 
         # Refrescar la UI mientras la descarga está en curso
         if dl_state["running"]:

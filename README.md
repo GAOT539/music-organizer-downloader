@@ -1,9 +1,3 @@
-﻿# 🐱 Sello de Gato Music — Music Organizer & Downloader
-
-<div align="center">
-
----
-
 ## 📋 Tabla de Contenidos
 
 - [¿Qué es Sello de Gato Music?](#-qué-es-sello-de-gato-music)
