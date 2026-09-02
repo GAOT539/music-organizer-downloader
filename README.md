@@ -1,27 +1,84 @@
+# 🐱 Sello de Gato Music
+
+> **Aplicación web local y dockerizada que transforma tu biblioteca de Spotify en una colección de música offline organizada, etiquetada y validada con estándares de producción.**
+
 ## 📋 Tabla de Contenidos
 
 - [¿Qué es Sello de Gato Music?](#-qué-es-sello-de-gato-music)
-- [✨ Características Principales](#-características-principales)
-- [⚠️ Obtención del Archivo CSV (Paso Obligatorio)](#️-obtención-del-archivo-csv-paso-obligatorio)
-- [🔧 Requisitos Previos](#-requisitos-previos)
-- [⚙️ Instalación y Configuración](#️-instalación-y-configuración)
-- [🚀 Ejecución](#-ejecución)
-- [📂 Estructura del Proyecto](#-estructura-del-proyecto)
-- [🛠️ Tech Stack](#️-tech-stack)
-- [❓ Preguntas Frecuentes](#-preguntas-frecuentes)
+- [Arquitectura e Ingeniería](#-arquitectura-e-ingeniería)
+- [Características Principales](#-características-principales)
+- [Obtención del Archivo CSV (Paso Obligatorio)](#%EF%B8%8F-obtención-del-archivo-csv-paso-obligatorio)
+- [Requisitos Previos](#-requisitos-previos)
+- [Instalación y Configuración](#%EF%B8%8F-instalación-y-configuración)
+- [Ejecución](#-ejecución)
+- [Estructura del Proyecto](#-estructura-del-proyecto)
+- [Tech Stack](#%EF%B8%8F-tech-stack)
+- [Preguntas Frecuentes](#-preguntas-frecuentes)
 
 ---
 
 ## 🐱 ¿Qué es Sello de Gato Music?
 
-**Sello de Gato Music** es una aplicación web local y 100% dockerizada que transforma tu biblioteca de Spotify en una colección de música offline perfectamente organizada y etiquetada.
+**Sello de Gato Music** es una aplicación web local y 100% dockerizada que toma como entrada un archivo CSV exportado desde **[Exportify](https://exportify.net/)** y ofrece dos funcionalidades en una única interfaz Streamlit:
 
-La app toma como entrada un archivo CSV exportado de tu lista de reproducción de Spotify y te ofrece dos funcionalidades principales en una única interfaz:
+1. **Dashboard Analítico**: Estadísticas interactivas con Plotly sobre artistas, géneros, años de lanzamiento y audio-features de tu colección.
+2. **Descargador Inteligente Multi-Hilo**: Descarga concurrente de canciones como MP3 de alta calidad con metadatos ID3 completos, carátula HD de iTunes y letras sincronizadas.
 
-1. **Dashboard Analítico**: Explora visualmente tu colección con estadísticas y gráficos interactivos sobre tus artistas, géneros, años de lanzamiento y audio-features.
-2. **Descargador Inteligente**: Descarga cada canción como MP3 de alta calidad con todos sus metadatos ID3 incrustados automáticamente (título, artista, álbum, año, género, carátula HD y letras sincronizadas).
+---
 
-Todo corre en un contenedor Docker, sin instalaciones manuales de dependencias complejas.
+## 🏗 Arquitectura e Ingeniería
+
+### Concurrencia Multi-Hilo con `ThreadPoolExecutor`
+
+El motor de descarga utiliza un `ThreadPoolExecutor` configurable (1-5 workers) para procesar múltiples pistas simultáneamente. Cada worker opera con un **prefijo de archivo temporal único** (`_tmp_{task_idx}_`) que garantiza aislamiento total entre hilos y previene colisiones de archivos.
+
+Un **lock global** (`threading.Lock`) protege todas las operaciones de I/O compartido:
+- Escritura en la consola en vivo (`log_lines`)
+- Persistencia en disco (`registro_descargas.txt`)
+- Contadores de progreso (`success_count`, `progress`)
+- Estado actual de la pista (`current_track`)
+
+### Inyector de Contexto de Streamlit (`add_script_run_ctx`)
+
+Streamlit vincula su `session_state` al hilo del script principal mediante un `ScriptRunContext`. Los hilos del pool no heredan este contexto de forma nativa, lo que provocaría un crash al intentar acceder a `st.session_state`.
+
+El wrapper `_worker_wrapper()` inyecta el contexto del script activo en cada hilo del pool mediante `add_script_run_ctx(threading.current_thread())`, con fallback silencioso para compatibilidad entre versiones de Streamlit.
+
+### Cancelación Cooperativa Thread-Safe
+
+La clase `DownloadControl` encapsula un `threading.Event` compartido entre la UI y los hilos de descarga. El diseño cooperativo permite cancelar sin forzar interrupciones:
+- Cada worker verifica `is_cancelled` en múltiples puntos estratégicos (antes de descargar, tras validar existencia, antes de cada motor).
+- El orquestador deja de enviar tareas al pool y cancela los futures pendientes.
+
+### 4 Capas de Validación Anti-Corrupción MP3
+
+Cada pista pasa por cuatro capas de validación antes de aceptarse como exitosa:
+
+| Capa | Nombre | Momento | Descripción |
+|------|--------|---------|-------------|
+| 1 | **Omisión Robusta** | Pre-descarga | Verifica existencia + tamaño > 100 KB + validación estructural con `is_valid_mp3()`. Si el archivo existe pero está corrupto, lo elimina y re-descarga. |
+| 2 | **Validación de Duración** | Post-descarga | Compara la duración real del MP3 (Mutagen) contra `Duration (ms)` del CSV con tolerancia de ±35 segundos. |
+| 3 | **Pre-verificación Web** | Pre-descarga | Consulta metadatos de YouTube vía `yt-dlp` con `download=False` para descartar videos cortos, teasers o Shorts (tolerancia ±40s). |
+| 4 | **Validación Estructural** | Post-descarga | Intenta abrir el MP3 con Mutagen para detectar archivos falsos (`.webm`/`.m4a` renombrados a `.mp3`) o headers corruptos. |
+
+Las capas 2 y 4 se ejecutan combinadas sobre el archivo temporal. El **renombrado atómico** (`os.replace`) al nombre final solo ocurre cuando todas las validaciones y la incrustación de metadatos han sido exitosas.
+
+### Integración de Metadatos con iTunes API
+
+Los metadatos se obtienen siguiendo una estrategia de prioridad:
+
+1. **iTunes Search API** (fuente primaria): título, artista, álbum, género, año, carátula HD 1000×1000.
+2. **CSV/DataFrame** (fallback): cualquier campo que iTunes no devuelva.
+3. **Spotify audio-features** (siempre del CSV): Popularity, Danceability, Energy, Valence, Tempo, Explicit — incrustados como `COMM`.
+4. **syncedlyrics**: letras `USLT` (texto plano) y `SYLT` (sincronizadas con timestamps en ms).
+
+### Sesión HTTP Reutilizable
+
+Un `requests.Session` global reutiliza conexiones TCP (keep-alive) para reducir latencia en llamadas repetitivas a iTunes, carátulas y syncedlyrics. Es thread-safe internamente gracias al locking del connection pool de urllib3.
+
+### Registro Persistente Thread-Safe
+
+El archivo `registro_descargas.txt` se escribe línea a línea con protección `_io_lock`. Se almacena junto a la música descargada y soporta filtros dinámicos en la UI (Errores / Éxitos / Omitidos / Todos).
 
 ---
 
@@ -29,125 +86,96 @@ Todo corre en un contenedor Docker, sin instalaciones manuales de dependencias c
 
 ### 📊 Dashboard Analítico Interactivo
 
-- **Métricas globales** de tu colección: total de canciones, artistas únicos, álbumes, horas acumuladas, popularidad media y porcentaje de canciones explícitas.
-- **Gráfico de Top 10 Artistas** más guardados (barras horizontales).
-- **Histograma de distribución por Año de Lanzamiento** de tu biblioteca.
-- **Scatter plot Energy vs. Valence** con hover interactivo por canción (si el CSV incluye audio-features).
-- **Ranking de Géneros** más escuchados, expandiendo géneros separados por coma.
-- **Tabla de las 20 Canciones Más Populares** con todos sus audio-features.
+- **Métricas globales**: total de canciones, artistas únicos, álbumes, horas acumuladas, popularidad media y porcentaje de canciones explícitas.
+- **Top 10 Artistas** más guardados (barras horizontales).
+- **Distribución por Año de Lanzamiento** (histograma).
+- **Scatter plot Energy vs. Valence** con hover interactivo por canción.
+- **Ranking de Géneros** más escuchados.
+- **Tabla de las 20 Canciones Más Populares** con audio-features.
 
 ### 📥 Descargador Multi-Motor con Cascada Automática
 
-Elige entre tres estrategias de descarga para maximizar el éxito:
+| Estrategia | Descripción |
+|------------|-------------|
+| **Solo yt-dlp** *(Recomendado)* | Busca en YouTube y descarga como MP3 VBR 0 (~320 kbps). |
+| **Cascada Automática** | Intenta `spotdl` primero; si falla, recurre a `yt-dlp`. |
+| **Solo spotdl** | Descarga directa integrada con Spotify (requiere credenciales). |
 
-| Estrategia                              | Descripción                                                                                         |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| **Solo yt-dlp** *(Recomendado)* | Rápido y confiable. Busca la canción en YouTube y la descarga como MP3 320kbps.                    |
-| **Cascada Automática**           | Intenta primero con`spotdl` (directo de Spotify). Si falla, recurre automáticamente a `yt-dlp`. |
-| **Solo spotdl**                   | Usa la integración directa con la API de Spotify para descargar. Requiere credenciales.             |
+- **Ruta de descarga configurable desde la UI**: campo editable que apunta por defecto a la carpeta nativa `Música` del sistema operativo (`~/Music`).
+- **Consola en vivo** con output en tiempo real.
+- **Barra de progreso** canción a canción.
+- **Panel de registro** con filtros por estado (Errores / Éxitos / Omitidos / Todos).
+- **Descarga concurrente** configurable de 1 a 5 hilos simultáneos.
+- **Cancelación en caliente** con reanudación posterior.
+- **Reporte de errores** exportable como CSV.
 
-- **Consola en vivo** con output en tiempo real durante la descarga.
-- **Barra de progreso** que refleja el estado canción a canción.
-- **Reporte de errores** al finalizar: genera y exporta un CSV con las canciones que no pudieron descargarse.
-- **Verificación de duplicados**: omite automáticamente los archivos ya descargados.
+### 🏷️ Etiquetas ID3 Incrustadas
 
-### 🏷️ Incrustación Completa de Etiquetas ID3
+Cada MP3 recibe automáticamente:
 
-Cada MP3 descargado recibe automáticamente:
-
-- `TIT2` — Título de la canción
-- `TPE1` — Artista(s) completo(s)
-- `TALB` — Nombre del álbum
-- `TDRC` — Año de lanzamiento
-- `TCON` — Género principal
-- `TRCK` — Número de pista / disco
-- `APIC` — Carátula HD descargada desde la URL del CSV
-- `USLT` — Letra no sincronizada (texto plano)
-- `SYLT` — Letra sincronizada con timestamps en milisegundos (estilo karaoke)
-- `COMM` — Audio-features de Spotify como comentario (Popularidad, Danceability, Energy, Valence, Tempo)
+| Tag | Contenido |
+|-----|-----------|
+| `TIT2` | Título de la canción |
+| `TPE1` | Artista(s) completo(s) |
+| `TALB` | Nombre del álbum |
+| `TDRC` | Año de lanzamiento |
+| `TCON` | Género principal |
+| `TRCK` | Número de pista / disco |
+| `APIC` | Carátula HD (iTunes 1000×1000 > URL del CSV) |
+| `USLT` | Letra no sincronizada (texto plano) |
+| `SYLT` | Letra sincronizada con timestamps (estilo karaoke) |
+| `COMM` | Audio-features de Spotify (Popularity, Danceability, Energy, Valence, Tempo) |
 
 ### 📁 Organización Automática de Carpetas
 
-Los archivos se organizan con la siguiente jerarquía:
-
 ```
-music_export/
-└── {Carpeta Raíz Personalizada}/
+~/Music/                          ← Ruta base configurable
+└── {Subcarpeta personalizada}/
     └── {Artista Principal}/
-        └── {Título}, {Álbum}, {Artista}.mp3
+        ├── Canción, Álbum, Artista.mp3
+        └── ...
 ```
 
-> Los nombres se sanitizan automáticamente para eliminar caracteres inválidos en el sistema de archivos.
+> Los nombres se sanitizan automáticamente para eliminar caracteres inválidos del sistema de archivos.
 
 ---
 
 ## ⚠️ Obtención del Archivo CSV (Paso Obligatorio)
 
-> **Este paso es fundamental.** La aplicación **no puede funcionar** sin un archivo CSV válido exportado de Spotify. A continuación se explica cómo obtenerlo.
+> **La aplicación requiere obligatoriamente un archivo CSV exportado desde [Exportify](https://exportify.net/).** Sin este archivo, la app no puede funcionar.
 
 ### Exportar tu biblioteca desde Exportify
 
-**[Exportify](https://exportify.net/)** es una herramienta web gratuita que permite exportar cualquier lista de reproducción de Spotify como archivo CSV con todos sus metadatos.
+**[Exportify](https://exportify.net/)** es una herramienta web gratuita que exporta cualquier lista de reproducción de Spotify como CSV con todos sus metadatos.
 
-Sigue estos pasos:
+**Paso 1** — Navega a **[https://exportify.net/](https://exportify.net/)**
 
----
+**Paso 2** — Haz clic en **"Log in with Spotify"** y autoriza el acceso (solo lectura).
 
-**Paso 1 — Abrir Exportify**
+**Paso 3** — Localiza **"❤️ Liked Songs"** en el listado de playlists.
 
-Navega a **[https://exportify.net/](https://exportify.net/)** en tu navegador.
+**Paso 4** — Haz clic en **"Export"** para descargar el `.csv`.
 
----
+**Paso 5** — En la barra lateral de la app, usa **"📂 Sube tu archivo CSV de Spotify"** para cargar el archivo.
 
-**Paso 2 — Iniciar sesión con Spotify**
-
-Haz clic en el botón **"Log in with Spotify"** y autoriza el acceso. Exportify solo necesita permisos de lectura; no modifica tu cuenta.
-
----
-
-**Paso 3 — Localizar "Liked Songs" (Tus Me Gusta)**
-
-Una vez autenticado, verás el listado de todas tus playlists. Busca la fila llamada:
-
-```
-❤️  Liked Songs
-```
-
----
-
-**Paso 4 — Exportar el CSV**
-
-Haz clic en el botón **"Export"** que aparece junto a la playlist. Se descargará automáticamente un archivo `.csv` con el nombre de la playlist (por ejemplo, `Liked Songs.csv`).
-
----
-
-**Paso 5 — Cargar el CSV en la aplicación**
-
-En la barra lateral izquierda de la app, usa el selector de archivos **"📂 Sube tu archivo CSV de Spotify"** y carga el archivo descargado. El Dashboard y el Descargador se activarán automáticamente.
-
-> **💡 Consejo Pro:** Para obtener columnas adicionales como `Genres`, `Popularity`, `Danceability`, `Energy`, `Valence` y `Tempo`, considera enriquecer el CSV con la [Spotify Web API](https://developer.spotify.com/documentation/web-api). Estas columnas activan gráficos adicionales en el Dashboard y permiten incrustar audio-features como comentarios en los MP3.
+> **💡 Consejo:** Para obtener columnas como `Genres`, `Popularity`, `Danceability`, `Energy`, `Valence` y `Tempo`, enriquece el CSV con la [Spotify Web API](https://developer.spotify.com/documentation/web-api). Estas columnas activan gráficos adicionales en el Dashboard y se incrustan como metadatos en los MP3.
 
 ---
 
 ## 🔧 Requisitos Previos
 
-Asegúrate de tener instalado lo siguiente en tu sistema **antes** de continuar:
+| Herramienta | Versión Mínima | Descripción |
+|-------------|----------------|-------------|
+| **Docker Desktop** | 24.x+ | Motor de contenedores | 
+| **Docker Compose** | v2.x+ | Incluido en Docker Desktop |
 
-| Herramienta              | Versión Mínima | Descripción                             | Enlace                                                      |
-| ------------------------ | ---------------- | ---------------------------------------- | ----------------------------------------------------------- |
-| **Docker Desktop** | 24.x+            | Motor de contenedores                    | [Descargar](https://www.docker.com/products/docker-desktop/) |
-| **Docker Compose** | v2.x+            | Orquestador (incluido en Docker Desktop) | [Docs](https://docs.docker.com/compose/)                     |
+### Credenciales de Spotify *(Solo para modo spotdl)*
 
-### Credenciales de Spotify for Developers *(Solo para modo spotdl)*
-
-Si planeas usar la estrategia **"Solo spotdl"** o **"Cascada Automática"**, necesitarás un par de credenciales de la API de Spotify:
+Si usas **"Solo spotdl"** o **"Cascada Automática"**:
 
 1. Accede al **[Spotify for Developers Dashboard](https://developer.spotify.com/dashboard)**.
-2. Inicia sesión con tu cuenta de Spotify.
-3. Crea una nueva aplicación (el nombre es arbitrario).
-4. Copia tu **Client ID** y tu **Client Secret**.
-
-> Estas credenciales se ingresan directamente en la interfaz de la app en tiempo de ejecución. **No es necesario configurarlas en el `.env`.**
+2. Crea una aplicación y copia tu **Client ID** y **Client Secret**.
+3. Ingrésalos directamente en la interfaz de la app en tiempo de ejecución.
 
 ---
 
@@ -160,11 +188,9 @@ git clone https://github.com/GAOT539/music-organizer-downloader.git
 cd music-organizer-downloader
 ```
 
-### 2. Configurar las variables de entorno
+### 2. Configurar variables de entorno
 
-El proyecto utiliza un archivo `.env` para definir la variable `HOST_DOWNLOAD_DIR`, que apunta a la carpeta local de tu sistema donde Docker montará el volumen de salida de música.
-
-**Crea tu archivo `.env` a partir de la plantilla incluida:**
+Crea tu archivo `.env` a partir de la plantilla:
 
 ```bash
 # Linux / macOS
@@ -177,21 +203,24 @@ copy .env.example .env
 Copy-Item .env.example .env
 ```
 
-**Edita el archivo `.env` y ajusta la ruta según tu sistema operativo:**
+El proyecto usa la variable `HOST_MUSIC_DIR` para definir qué carpeta del host se monta como volumen de salida en Docker.
+
+**Si no defines `HOST_MUSIC_DIR`**, docker-compose usará `~/Music` automáticamente (la carpeta nativa de Música del sistema).
+
+Para usar una ruta personalizada, descomenta y edita en tu `.env`:
 
 ```dotenv
-# --- Windows ---
-HOST_DOWNLOAD_DIR=C:\Users\TuUsuario\Downloads
+# Windows
+HOST_MUSIC_DIR=C:\Users\TuUsuario\Music
 
-# --- Linux / macOS ---
-# HOST_DOWNLOAD_DIR=/home/tuusuario/Downloads
+# Linux
+# HOST_MUSIC_DIR=/home/tuusuario/Music
+
+# macOS
+# HOST_MUSIC_DIR=/Users/tuusuario/Music
 ```
 
-> **🔐 Seguridad:** El archivo `.env` está incluido en `.gitignore` y **nunca** debe subirse al repositorio. Contiene rutas locales específicas de cada máquina.
-
-### ¿Por qué es necesario el `.env`?
-
-Docker necesita saber qué carpeta de tu sistema operativo anfitrión (host) debe montar dentro del contenedor. La variable `HOST_DOWNLOAD_DIR` hace que el proyecto sea **completamente portable**: cada desarrollador o usuario define su propia ruta local sin necesidad de modificar el `docker-compose.yml`.
+> **🔐 Seguridad:** El archivo `.env` está en `.gitignore` y nunca debe subirse al repositorio.
 
 ---
 
@@ -199,44 +228,30 @@ Docker necesita saber qué carpeta de tu sistema operativo anfitrión (host) deb
 
 ### Construir y levantar el contenedor
 
-Desde la raíz del proyecto, ejecuta:
-
 ```bash
 docker compose up --build
 ```
 
-- `--build` fuerza la reconstrucción de la imagen Docker. Úsalo siempre en la primera ejecución o tras modificar `requirements.txt` o el `Dockerfile`.
-- El proceso instalará todas las dependencias dentro del contenedor (puede tardar algunos minutos la primera vez).
+- `--build` reconstruye la imagen. Úsalo en la primera ejecución o tras modificar dependencias.
+- La primera vez puede tardar 5-15 minutos mientras descarga la imagen base, FFmpeg y dependencias Python.
 
 ### Acceder a la aplicación
 
-Una vez que veas en la consola el mensaje:
-
 ```
-You can now view your Streamlit app in your browser.
-  URL: http://0.0.0.0:8501
+http://localhost:8501
 ```
-
-Abre tu navegador y navega a:
-
-**[http://localhost:8501](http://localhost:8501)**
 
 ### Detener el contenedor
 
 ```bash
-# Detener sin eliminar los contenedores
-docker compose stop
-
-# Detener y eliminar los contenedores
-docker compose down
+docker compose stop          # Detener sin eliminar
+docker compose down          # Detener y eliminar
 ```
 
-### Ejecuciones posteriores (sin reconstruir)
-
-Si no realizaste cambios en las dependencias, puedes iniciar el proyecto más rápido con:
+### Ejecuciones posteriores
 
 ```bash
-docker compose up
+docker compose up            # Sin reconstruir (rápido)
 ```
 
 ---
@@ -246,43 +261,45 @@ docker compose up
 ```
 music-organizer-downloader/
 │
-├── app.py                  # Aplicación principal de Streamlit (UI + lógica de descarga)
+├── app.py                  # Aplicación Streamlit (UI + orquestador multi-hilo)
 ├── logo.png                # Logotipo de Sello de Gato Music
 │
-├── Dockerfile              # Imagen Docker basada en python:3.11-slim con FFmpeg
-├── docker-compose.yml      # Definición del servicio, puertos y volúmenes
+├── Dockerfile              # Imagen basada en python:3.11-slim con FFmpeg
+├── docker-compose.yml      # Servicio, puertos y volumen → ~/Music
 │
-├── requirements.txt        # Dependencias de Python (Streamlit, yt-dlp, mutagen, etc.)
+├── requirements.txt        # Dependencias Python
 │
-├── .env                    # Variables de entorno locales (NO subir a Git)
-├── .env.example            # Plantilla de variables de entorno (sí incluida en Git)
-├── .gitignore              # Archivos y carpetas excluidos del control de versiones
+├── .env                    # Variables de entorno locales (NO en Git)
+├── .env.example            # Plantilla de variables de entorno
+├── .gitignore              # Exclusiones de Git
 │
-├── data/                   # Carpeta interna del contenedor para datos temporales
-└── music_export/           # Carpeta de salida: aquí se guardan los MP3 descargados
-    └── {Carpeta Raíz}/
+├── data/                   # Datos temporales del contenedor
+└── ~/Music/                # Salida por defecto (carpeta Música del sistema)
+    └── {Subcarpeta}/
         └── {Artista}/
-            └── Cancion, Album, Artista.mp3
+            ├── Cancion, Album, Artista.mp3
+            └── registro_descargas.txt
 ```
 
 ---
 
 ## 🛠️ Tech Stack
 
-| Categoría                     | Tecnología                                                | Versión  | Descripción                                     |
-| ------------------------------ | ---------------------------------------------------------- | --------- | ------------------------------------------------ |
-| **UI Framework**         | [Streamlit](https://streamlit.io/)                          | ≥ 1.62   | Framework para la interfaz web interactiva       |
-| **Data Processing**      | [Pandas](https://pandas.pydata.org/)                        | ≥ 3.0    | Carga, limpieza y procesamiento del CSV          |
-| **Visualización**       | [Plotly Express](https://plotly.com/python/plotly-express/) | ≥ 7.0    | Gráficos interactivos del Dashboard             |
-| **Motor de Descarga 1**  | [yt-dlp](https://github.com/yt-dlp/yt-dlp)                  | ≥ 2026.8 | Descarga de audio desde YouTube                  |
-| **Motor de Descarga 2**  | [spotdl](https://github.com/spotDL/spotify-downloader)      | ≥ 4.5.2  | Descarga directa integrada con Spotify           |
-| **Metadata de Audio**    | [Mutagen](https://mutagen.readthedocs.io/)                  | ≥ 1.48   | Escritura de etiquetas ID3 en archivos MP3       |
-| **Letras Sincronizadas** | [syncedlyrics](https://github.com/moehmeni/syncedlyrics)    | ≥ 1.0    | Obtención de letras LRC con timestamps          |
-| **API de Spotify**       | [Spotipy](https://spotipy.readthedocs.io/)                  | ≥ 2.26   | Cliente de la Spotify Web API (usado por spotdl) |
-| **Imágenes**            | [Pillow](https://pillow.readthedocs.io/)                    | ≥ 12.3   | Manejo del logotipo de la página                |
-| **Transcodificación**   | [FFmpeg](https://ffmpeg.org/)                               | Sistema   | Conversión de audio a MP3 (instalado en Docker) |
-| **Contenerización**     | [Docker](https://www.docker.com/)                           | 24.x+     | Aislamiento y portabilidad del entorno           |
-| **Base Image**           | `python:3.11-slim`                                       | —        | Imagen Docker base ligera                        |
+| Categoría | Tecnología | Versión | Rol |
+|-----------|-----------|---------|-----|
+| **UI** | [Streamlit](https://streamlit.io/) | ≥ 1.62 | Interfaz web interactiva |
+| **Data** | [Pandas](https://pandas.pydata.org/) | ≥ 3.0 | Procesamiento del CSV |
+| **Gráficos** | [Plotly Express](https://plotly.com/python/plotly-express/) | ≥ 7.0 | Visualizaciones del Dashboard |
+| **Descarga 1** | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | ≥ 2026.8 | Audio desde YouTube |
+| **Descarga 2** | [spotdl](https://github.com/spotDL/spotify-downloader) | ≥ 4.5.2 | Descarga directa Spotify |
+| **Metadata** | [Mutagen](https://mutagen.readthedocs.io/) | ≥ 1.48 | Etiquetas ID3 en MP3 |
+| **Letras** | [syncedlyrics](https://github.com/moehmeni/syncedlyrics) | ≥ 1.0 | Letras LRC sincronizadas |
+| **Spotify API** | [Spotipy](https://spotipy.readthedocs.io/) | ≥ 2.26 | Cliente API (para spotdl) |
+| **HTTP** | [Requests](https://docs.python-requests.org/) | ≥ 2.34 | iTunes API + carátulas |
+| **Imágenes** | [Pillow](https://pillow.readthedocs.io/) | ≥ 12.3 | Logo de la app |
+| **Audio** | [FFmpeg](https://ffmpeg.org/) | Sistema | Transcodificación a MP3 |
+| **Container** | [Docker](https://www.docker.com/) | 24.x+ | Aislamiento y portabilidad |
+| **Base Image** | `python:3.11-slim` | — | Imagen Docker ligera |
 
 ---
 
@@ -291,31 +308,49 @@ music-organizer-downloader/
 <details>
 <summary><strong>¿Por qué el primer arranque tarda tanto?</strong></summary>
 
-La primera vez que ejecutas `docker compose up --build`, Docker descarga la imagen base, instala FFmpeg y todas las dependencias de Python. Este proceso puede durar entre 5 y 15 minutos dependiendo de tu conexión. Las ejecuciones posteriores son casi instantáneas gracias al caché de capas de Docker.
+La primera vez que ejecutas `docker compose up --build`, Docker descarga la imagen base, instala FFmpeg y todas las dependencias Python. Puede durar entre 5 y 15 minutos. Las ejecuciones posteriores son casi instantáneas gracias al caché de capas de Docker.
 
 </details>
 
 <details>
-<summary><strong>¿Qué formato tienen los archivos descargados?</strong></summary>
+<summary><strong>¿Qué formato y calidad tienen los archivos?</strong></summary>
 
-Todos los archivos se descargan y convierten a **MP3 a máxima calidad (VBR 0 con yt-dlp, 320kbps con spotdl)**. Los metadatos ID3v2 completos se incrustan directamente en el archivo, incluyendo carátula HD y letras cuando están disponibles.
-
-</details>
-
-<details>
-<summary><strong>¿Dónde se guardan los archivos descargados?</strong></summary>
-
-Los archivos se guardan dentro de la carpeta `music_export/` en la raíz del proyecto (montada como volumen en Docker). Puedes cambiar la ruta del volumen en el archivo `.env` con la variable `HOST_DOWNLOAD_DIR`.
+Todos los archivos se descargan como **MP3** a máxima calidad (VBR 0 con yt-dlp ≈ 320 kbps, 320k explícito con spotdl). Los metadatos ID3v2 completos se incrustan en cada archivo, incluyendo carátula HD de iTunes (1000×1000) y letras sincronizadas.
 
 </details>
 
 <details>
-<summary><strong>La columna "Genres" no aparece en mi CSV. ¿Qué hago?</strong></summary>
+<summary><strong>¿Dónde se guardan los archivos?</strong></summary>
 
-La columna `Genres` no siempre está disponible en la exportación estándar de Exportify. Si no está presente, los gráficos de géneros simplemente no aparecerán, pero el resto de la aplicación funcionará con normalidad. Para obtenerla, puedes enriquecer el CSV consultando el endpoint [`/artists`](https://github.com/pavelkomarov/exportify) de la Spotify Web API.
+Por defecto, en la carpeta **Música** de tu sistema operativo (`~/Music`). Puedes cambiar la ruta directamente desde la UI de la app (campo "Ruta Base de Descarga") o mediante la variable `HOST_MUSIC_DIR` en el `.env` para Docker.
+
+</details>
+
+<details>
+<summary><strong>¿Cómo funciona la cancelación de descargas?</strong></summary>
+
+El botón "🛑 Cancelar Descarga" activa un `threading.Event` compartido. Cada worker verifica este flag en múltiples puntos estratégicos y se detiene cooperativamente. La pista que está en proceso de descarga terminará antes de detenerse. Al presionar "Iniciar / Reanudar", la app retoma desde donde se quedó (las canciones ya descargadas se omiten automáticamente).
+
+</details>
+
+<details>
+<summary><strong>La columna "Genres" no aparece en mi CSV</strong></summary>
+
+La columna `Genres` no siempre está en la exportación de Exportify. Si no está presente, los gráficos de géneros no aparecerán pero la app funciona normalmente. Para obtenerla, enriquece el CSV con el endpoint `/artists` de la Spotify Web API.
+
+</details>
+
+<details>
+<summary><strong>¿Es necesario el .env para ejecutar sin Docker?</strong></summary>
+
+No. En ejecución local (sin Docker), la app detecta automáticamente la carpeta Música del sistema mediante `pathlib.Path.home() / 'Music'`. El `.env` solo es necesario para configurar el volumen de Docker.
 
 </details>
 
 ---
 
 <div align="center">
+
+**Sello de Gato Music** — Hecho con 🐱 y Python
+
+</div>

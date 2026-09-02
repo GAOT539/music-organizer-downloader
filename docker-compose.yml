@@ -6,9 +6,9 @@ services:
       - "8501:8501"
     volumes:
       - ./data:/app/data
-      # Las descargas van a HOST_DOWNLOAD_DIR (del .env). Si Docker no tiene
-      # permiso a esa ruta, cambia HOST_DOWNLOAD_DIR=./music_export en el .env.
-      - ${HOST_DOWNLOAD_DIR:-./music_export}:/app/music_export
+      # Descargas: HOST_MUSIC_DIR apunta a la carpeta Música del host.
+      # Si no se define, Docker usa ~/Music por defecto.
+      - ${HOST_MUSIC_DIR:-~/Music}:/app/output
       - ./app.py:/app/app.py
       - ./logo.png:/app/logo.png
     restart: unless-stopped
