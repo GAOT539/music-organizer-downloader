@@ -1,13 +1,15 @@
-# 🐱 Sello de Gato Music
+# 🐱 Sello de Gato Music — V1.0
 
 > **Aplicación web local y dockerizada que transforma tu biblioteca de Spotify en una colección de música offline organizada, etiquetada y validada con estándares de producción.**
+
+---
 
 ## 📋 Tabla de Contenidos
 
 - [¿Qué es Sello de Gato Music?](#-qué-es-sello-de-gato-music)
+- [Obtención del Archivo CSV](#%EF%B8%8F-obtención-del-archivo-csv-paso-obligatorio)
 - [Arquitectura e Ingeniería](#-arquitectura-e-ingeniería)
-- [Características Principales](#-características-principales)
-- [Obtención del Archivo CSV (Paso Obligatorio)](#%EF%B8%8F-obtención-del-archivo-csv-paso-obligatorio)
+- [Características V1.0](#-características-v10)
 - [Requisitos Previos](#-requisitos-previos)
 - [Instalación y Configuración](#%EF%B8%8F-instalación-y-configuración)
 - [Ejecución](#-ejecución)
@@ -19,130 +21,16 @@
 
 ## 🐱 ¿Qué es Sello de Gato Music?
 
-**Sello de Gato Music** es una aplicación web local y 100% dockerizada que toma como entrada un archivo CSV exportado desde **[Exportify](https://exportify.net/)** y ofrece dos funcionalidades en una única interfaz Streamlit:
+**Sello de Gato Music** es una aplicación web local y 100% dockerizada que toma como entrada un archivo CSV exportado desde **[Exportify](https://exportify.net/)** y ofrece dos módulos en una única interfaz Streamlit:
 
 1. **Dashboard Analítico**: Estadísticas interactivas con Plotly sobre artistas, géneros, años de lanzamiento y audio-features de tu colección.
-2. **Descargador Inteligente Multi-Hilo**: Descarga concurrente de canciones como MP3 de alta calidad con metadatos ID3 completos, carátula HD de iTunes y letras sincronizadas.
-
----
-
-## 🏗 Arquitectura e Ingeniería
-
-### Concurrencia Multi-Hilo con `ThreadPoolExecutor`
-
-El motor de descarga utiliza un `ThreadPoolExecutor` configurable (1-5 workers) para procesar múltiples pistas simultáneamente. Cada worker opera con un **prefijo de archivo temporal único** (`_tmp_{task_idx}_`) que garantiza aislamiento total entre hilos y previene colisiones de archivos.
-
-Un **lock global** (`threading.Lock`) protege todas las operaciones de I/O compartido:
-- Escritura en la consola en vivo (`log_lines`)
-- Persistencia en disco (`registro_descargas.txt`)
-- Contadores de progreso (`success_count`, `progress`)
-- Estado actual de la pista (`current_track`)
-
-### Inyector de Contexto de Streamlit (`add_script_run_ctx`)
-
-Streamlit vincula su `session_state` al hilo del script principal mediante un `ScriptRunContext`. Los hilos del pool no heredan este contexto de forma nativa, lo que provocaría un crash al intentar acceder a `st.session_state`.
-
-El wrapper `_worker_wrapper()` inyecta el contexto del script activo en cada hilo del pool mediante `add_script_run_ctx(threading.current_thread())`, con fallback silencioso para compatibilidad entre versiones de Streamlit.
-
-### Cancelación Cooperativa Thread-Safe
-
-La clase `DownloadControl` encapsula un `threading.Event` compartido entre la UI y los hilos de descarga. El diseño cooperativo permite cancelar sin forzar interrupciones:
-- Cada worker verifica `is_cancelled` en múltiples puntos estratégicos (antes de descargar, tras validar existencia, antes de cada motor).
-- El orquestador deja de enviar tareas al pool y cancela los futures pendientes.
-
-### 4 Capas de Validación Anti-Corrupción MP3
-
-Cada pista pasa por cuatro capas de validación antes de aceptarse como exitosa:
-
-| Capa | Nombre | Momento | Descripción |
-|------|--------|---------|-------------|
-| 1 | **Omisión Robusta** | Pre-descarga | Verifica existencia + tamaño > 100 KB + validación estructural con `is_valid_mp3()`. Si el archivo existe pero está corrupto, lo elimina y re-descarga. |
-| 2 | **Validación de Duración** | Post-descarga | Compara la duración real del MP3 (Mutagen) contra `Duration (ms)` del CSV con tolerancia de ±35 segundos. |
-| 3 | **Pre-verificación Web** | Pre-descarga | Consulta metadatos de YouTube vía `yt-dlp` con `download=False` para descartar videos cortos, teasers o Shorts (tolerancia ±40s). |
-| 4 | **Validación Estructural** | Post-descarga | Intenta abrir el MP3 con Mutagen para detectar archivos falsos (`.webm`/`.m4a` renombrados a `.mp3`) o headers corruptos. |
-
-Las capas 2 y 4 se ejecutan combinadas sobre el archivo temporal. El **renombrado atómico** (`os.replace`) al nombre final solo ocurre cuando todas las validaciones y la incrustación de metadatos han sido exitosas.
-
-### Integración de Metadatos con iTunes API
-
-Los metadatos se obtienen siguiendo una estrategia de prioridad:
-
-1. **iTunes Search API** (fuente primaria): título, artista, álbum, género, año, carátula HD 1000×1000.
-2. **CSV/DataFrame** (fallback): cualquier campo que iTunes no devuelva.
-3. **Spotify audio-features** (siempre del CSV): Popularity, Danceability, Energy, Valence, Tempo, Explicit — incrustados como `COMM`.
-4. **syncedlyrics**: letras `USLT` (texto plano) y `SYLT` (sincronizadas con timestamps en ms).
-
-### Sesión HTTP Reutilizable
-
-Un `requests.Session` global reutiliza conexiones TCP (keep-alive) para reducir latencia en llamadas repetitivas a iTunes, carátulas y syncedlyrics. Es thread-safe internamente gracias al locking del connection pool de urllib3.
-
-### Registro Persistente Thread-Safe
-
-El archivo `registro_descargas.txt` se escribe línea a línea con protección `_io_lock`. Se almacena junto a la música descargada y soporta filtros dinámicos en la UI (Errores / Éxitos / Omitidos / Todos).
-
----
-
-## ✨ Características Principales
-
-### 📊 Dashboard Analítico Interactivo
-
-- **Métricas globales**: total de canciones, artistas únicos, álbumes, horas acumuladas, popularidad media y porcentaje de canciones explícitas.
-- **Top 10 Artistas** más guardados (barras horizontales).
-- **Distribución por Año de Lanzamiento** (histograma).
-- **Scatter plot Energy vs. Valence** con hover interactivo por canción.
-- **Ranking de Géneros** más escuchados.
-- **Tabla de las 20 Canciones Más Populares** con audio-features.
-
-### 📥 Descargador Multi-Motor con Cascada Automática
-
-| Estrategia | Descripción |
-|------------|-------------|
-| **Solo yt-dlp** *(Recomendado)* | Busca en YouTube y descarga como MP3 VBR 0 (~320 kbps). |
-| **Cascada Automática** | Intenta `spotdl` primero; si falla, recurre a `yt-dlp`. |
-| **Solo spotdl** | Descarga directa integrada con Spotify (requiere credenciales). |
-
-- **Ruta de descarga configurable desde la UI**: campo editable que apunta por defecto a la carpeta nativa `Música` del sistema operativo (`~/Music`).
-- **Consola en vivo** con output en tiempo real.
-- **Barra de progreso** canción a canción.
-- **Panel de registro** con filtros por estado (Errores / Éxitos / Omitidos / Todos).
-- **Descarga concurrente** configurable de 1 a 5 hilos simultáneos.
-- **Cancelación en caliente** con reanudación posterior.
-- **Reporte de errores** exportable como CSV.
-
-### 🏷️ Etiquetas ID3 Incrustadas
-
-Cada MP3 recibe automáticamente:
-
-| Tag | Contenido |
-|-----|-----------|
-| `TIT2` | Título de la canción |
-| `TPE1` | Artista(s) completo(s) |
-| `TALB` | Nombre del álbum |
-| `TDRC` | Año de lanzamiento |
-| `TCON` | Género principal |
-| `TRCK` | Número de pista / disco |
-| `APIC` | Carátula HD (iTunes 1000×1000 > URL del CSV) |
-| `USLT` | Letra no sincronizada (texto plano) |
-| `SYLT` | Letra sincronizada con timestamps (estilo karaoke) |
-| `COMM` | Audio-features de Spotify (Popularity, Danceability, Energy, Valence, Tempo) |
-
-### 📁 Organización Automática de Carpetas
-
-```
-~/Music/                          ← Ruta base configurable
-└── {Subcarpeta personalizada}/
-    └── {Artista Principal}/
-        ├── Canción, Álbum, Artista.mp3
-        └── ...
-```
-
-> Los nombres se sanitizan automáticamente para eliminar caracteres inválidos del sistema de archivos.
+2. **Descargador Inteligente Multi-Hilo**: Descarga concurrente de canciones como MP3 de alta calidad con metadatos ID3 completos, carátula HD y letras sincronizadas.
 
 ---
 
 ## ⚠️ Obtención del Archivo CSV (Paso Obligatorio)
 
-> **La aplicación requiere obligatoriamente un archivo CSV exportado desde [Exportify](https://exportify.net/).** Sin este archivo, la app no puede funcionar.
+> **⚠️ IMPORTANTE: La aplicación requiere obligatoriamente un archivo CSV exportado desde [Exportify](https://exportify.net/). Sin este archivo, la app no puede funcionar.**
 
 ### Exportar tu biblioteca desde Exportify
 
@@ -162,11 +50,169 @@ Cada MP3 recibe automáticamente:
 
 ---
 
+## 🏗 Arquitectura e Ingeniería
+
+### Concurrencia Multi-Hilo con `ThreadPoolExecutor`
+
+El motor de descarga utiliza un `ThreadPoolExecutor` configurable (1-5 workers) para procesar múltiples pistas simultáneamente. Cada worker opera con un **prefijo de archivo temporal único** (`_tmp_{task_idx}_`) que garantiza aislamiento total entre hilos y previene colisiones de archivos.
+
+Un **lock global** (`threading.Lock`) protege todas las operaciones de I/O compartido:
+- Escritura en la consola en vivo (`log_lines`)
+- Persistencia en disco (`registro_descargas.txt`)
+- Contadores de progreso (`success_count`, `progress`)
+- Estado actual de la pista (`current_track`)
+
+### Inyección de Contexto de Streamlit (`add_script_run_ctx`)
+
+Streamlit vincula su `session_state` al hilo del script principal mediante un `ScriptRunContext`. Los hilos del pool no heredan este contexto, lo que provocaría un crash al acceder a `st.session_state`.
+
+El wrapper `_worker_wrapper()` inyecta el contexto del script activo en cada hilo del pool mediante `add_script_run_ctx(threading.current_thread())`, con fallback silencioso para compatibilidad entre versiones de Streamlit.
+
+### Cancelación Cooperativa Thread-Safe
+
+La clase `DownloadControl` encapsula un `threading.Event` compartido entre la UI y los hilos de descarga:
+- Cada worker verifica `is_cancelled` en múltiples puntos estratégicos (antes de descargar, tras validar existencia, antes de cada motor).
+- El orquestador deja de enviar tareas al pool y cancela los futures pendientes.
+- Las canciones ya descargadas se preservan para reanudación automática.
+
+### 4 Capas de Validación Anti-Corrupción MP3
+
+Cada pista pasa por cuatro capas de validación antes de aceptarse como exitosa:
+
+| Capa | Nombre | Momento | Descripción |
+|:----:|--------|---------|-------------|
+| 1 | **Omisión Robusta** | Pre-descarga | Verifica existencia + tamaño > 100 KB + validación estructural con `is_valid_mp3()`. Si el archivo existe pero está corrupto, lo elimina y re-descarga. |
+| 2 | **Validación Estructural** | Post-descarga | Intenta abrir el MP3 con Mutagen para detectar archivos falsos (`.webm`/`.m4a` renombrados a `.mp3`) o headers corruptos. |
+| 3 | **Pre-verificación Web** | Pre-descarga | Consulta metadatos de YouTube vía `yt-dlp --skip_download` para: **a)** descartar videos con duración incorrecta (±40s vs CSV), y **b)** rechazar versiones Karaoke/Instrumental/Cover si el título original no las solicita. |
+| 4 | **Validación de Duración** | Post-descarga | Compara la duración real del MP3 (Mutagen) contra `Duration (ms)` del CSV con tolerancia ±35 segundos. |
+
+Las capas 2 y 4 se ejecutan combinadas sobre el archivo temporal. El **renombrado atómico** (`os.replace`) al nombre final solo ocurre cuando todas las validaciones y la incrustación de metadatos han sido exitosas.
+
+### Fusión Jerárquica de Metadatos — 3 Capas
+
+Los metadatos se construyen mediante un sistema de **merge por campo** que garantiza completitud al 100%:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  1º iTunes Search API (fuente primaria)                     │
+│  ├── trackName, artistName, collectionName                  │
+│  ├── primaryGenreName, releaseDate                          │
+│  └── artworkUrl → 1000×1000 HD                              │
+├─────────────────────────────────────────────────────────────┤
+│  2º CSV / DataFrame (fallback por campo)                    │
+│  ├── Track Name, Artist Name(s), Album Name                 │
+│  ├── Genres (primer elemento), Release Year / Release Date  │
+│  └── Album Image URL / Cover URL / Image URL                │
+├─────────────────────────────────────────────────────────────┤
+│  3º yt-dlp pre-existente (último recurso)                   │
+│  └── Tags ID3 escritos por yt-dlp antes del post-procesado  │
+│      (TIT2, TPE1, TALB, TDRC, TCON)                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+Si iTunes devuelve Título y Álbum pero le falta Año o Género, el script rellena esos huecos buscando primero en el CSV y luego en los tags que yt-dlp escribió en el archivo temporal.
+
+Adicionalmente, cada MP3 recibe:
+- **Spotify audio-features** (siempre del CSV): Popularity, Danceability, Energy, Valence, Tempo, Explicit — incrustados como `COMM`.
+- **Letras sincronizadas** vía `syncedlyrics`: `USLT` (texto plano) y `SYLT` (timestamps en ms).
+
+### Limpieza Inteligente de Títulos (Anti-Etiquetas Oficiales)
+
+Una regex precompilada (`_TITLE_LABEL_RE`) elimina automáticamente etiquetas de video de los títulos **antes** de generar el nombre de archivo y antes de verificar si ya existe:
+
+| Etiqueta eliminada | Ejemplo |
+|---|---|
+| `(Video Oficial)` / `[Official Video]` | `Mi Canción (Video Oficial)` → `Mi Canción` |
+| `(Audio Oficial)` / `[Official Audio]` | `Track [Official Audio]` → `Track` |
+| `[Official Music Video]` / `(Lyric Video)` | `Song (Lyric Video)` → `Song` |
+| `(Visualizer)` / `[HD]` / `[HQ]` | `Song [HD]` → `Song` |
+| `(Remastered 2023)` | `Song (Remastered 2023)` → `Song` |
+
+Cuando un título es modificado, se levanta una bandera por hilo que se transporta en la tupla de retorno y se registra en el log: `ÉXITO | Canción, Álbum, Artista | Título modificado: se limpió etiqueta de video`.
+
+### Normalización de Carpetas Anti-Duplicados
+
+La función `normalize_folder_name()` usa `unicodedata.normalize('NFD')` para eliminar tildes, diéresis y marcas diacríticas **únicamente** en los nombres de carpeta del sistema de archivos:
+
+- `Júan` → `Juan` (misma carpeta para "Júan" y "Juan")
+- `Bebé` → `Bebe`
+
+Las etiquetas ID3 dentro de los MP3 **conservan** los caracteres originales con tildes.
+
+### Sesión HTTP Reutilizable
+
+Un `requests.Session` global reutiliza conexiones TCP (keep-alive) para reducir latencia en llamadas repetitivas a iTunes y carátulas. Es thread-safe internamente gracias al locking del connection pool de urllib3.
+
+### Registro Persistente Thread-Safe
+
+El archivo `registro_descargas.txt` se escribe línea a línea con protección `_io_lock`. Se almacena junto a la música descargada y soporta filtros dinámicos en la UI (Errores / Éxitos / Omitidos / Todos).
+
+---
+
+## ✨ Características V1.0
+
+### 📊 Dashboard Analítico Interactivo
+
+- **Métricas globales**: total de canciones, artistas únicos, álbumes, horas acumuladas, popularidad media y porcentaje de canciones explícitas.
+- **Top 10 Artistas** más guardados (barras horizontales).
+- **Distribución por Año de Lanzamiento** (histograma).
+- **Scatter plot Energy vs. Valence** con hover interactivo por canción.
+- **Ranking de Géneros** más escuchados.
+- **Tabla de las 20 Canciones Más Populares** con audio-features.
+
+### 📥 Descargador Multi-Motor con Cascada Automática
+
+| Estrategia | Descripción |
+|------------|-------------|
+| **Solo yt-dlp** *(Recomendado)* | Busca en YouTube y descarga como MP3 VBR 0 (~320 kbps). |
+| **Cascada Automática** | Intenta `spotdl` primero; si falla, recurre a `yt-dlp`. |
+| **Solo spotdl** | Descarga directa integrada con Spotify (requiere credenciales). |
+
+- **Ruta de descarga configurable desde la UI**: campo editable que apunta por defecto a la carpeta nativa `Música` del sistema operativo.
+- **Detección automática de Docker**: si corre en contenedor, usa `/app/output` con indicador visual del mapeo al host.
+- **Consola en vivo** con output en tiempo real.
+- **Barra de progreso** canción a canción.
+- **Panel de registro** con filtros por estado (Errores / Éxitos / Omitidos / Todos).
+- **Descarga concurrente** configurable de 1 a 5 hilos simultáneos.
+- **Cancelación en caliente** con reanudación posterior.
+- **Reporte de errores** exportable como CSV.
+
+### 🏷️ Etiquetas ID3 Incrustadas
+
+Cada MP3 recibe automáticamente:
+
+| Tag | Contenido | Fuentes (prioridad) |
+|-----|-----------|---------------------|
+| `TIT2` | Título (limpio, sin etiquetas de video) | iTunes → CSV → yt-dlp |
+| `TPE1` | Artista(s) completo(s) | iTunes → CSV → yt-dlp |
+| `TALB` | Nombre del álbum | iTunes → CSV → yt-dlp |
+| `TDRC` | Año de lanzamiento | iTunes → CSV → yt-dlp |
+| `TCON` | Género principal | iTunes → CSV → yt-dlp |
+| `TRCK` | Número de pista / disco | CSV |
+| `APIC` | Carátula HD (iTunes 1000×1000 > URL del CSV) | iTunes → CSV |
+| `USLT` | Letra no sincronizada (texto plano) | syncedlyrics |
+| `SYLT` | Letra sincronizada con timestamps | syncedlyrics |
+| `COMM` | Audio-features de Spotify | CSV (Popularity, Danceability, Energy, Valence, Tempo) |
+
+### 📁 Organización Automática de Carpetas
+
+```
+~/Music/                              ← Ruta base configurable desde la UI
+└── {Subcarpeta personalizada}/
+    └── {Artista Principal}/           ← Normalizado (sin tildes en la carpeta)
+        ├── Canción, Álbum, Artista.mp3  ← Título limpio (sin etiquetas de video)
+        └── ...
+```
+
+> Los nombres de carpeta se normalizan con `unicodedata` (sin tildes) para evitar duplicados. Los nombres de archivo se sanitizan para eliminar caracteres inválidos del sistema de archivos. Las etiquetas ID3 conservan los caracteres originales.
+
+---
+
 ## 🔧 Requisitos Previos
 
 | Herramienta | Versión Mínima | Descripción |
 |-------------|----------------|-------------|
-| **Docker Desktop** | 24.x+ | Motor de contenedores | 
+| **Docker Desktop** | 24.x+ | Motor de contenedores |
 | **Docker Compose** | v2.x+ | Incluido en Docker Desktop |
 
 ### Credenciales de Spotify *(Solo para modo spotdl)*
@@ -297,6 +343,7 @@ music-organizer-downloader/
 | **Spotify API** | [Spotipy](https://spotipy.readthedocs.io/) | ≥ 2.26 | Cliente API (para spotdl) |
 | **HTTP** | [Requests](https://docs.python-requests.org/) | ≥ 2.34 | iTunes API + carátulas |
 | **Imágenes** | [Pillow](https://pillow.readthedocs.io/) | ≥ 12.3 | Logo de la app |
+| **Unicode** | `unicodedata` (stdlib) | — | Normalización de carpetas |
 | **Audio** | [FFmpeg](https://ffmpeg.org/) | Sistema | Transcodificación a MP3 |
 | **Container** | [Docker](https://www.docker.com/) | 24.x+ | Aislamiento y portabilidad |
 | **Base Image** | `python:3.11-slim` | — | Imagen Docker ligera |
@@ -334,6 +381,20 @@ El botón "🛑 Cancelar Descarga" activa un `threading.Event` compartido. Cada 
 </details>
 
 <details>
+<summary><strong>¿Qué hace el limpiador de títulos?</strong></summary>
+
+Una regex precompilada elimina automáticamente etiquetas como `(Video Oficial)`, `[Official Video]`, `(Audio Oficial)`, `[Lyric Video]`, `(Visualizer)`, `[HD]`, `[HQ]` y `(Remastered)` del título de la canción. Esto previene duplicados en disco y produce nombres de archivo más limpios. Cuando un título es modificado, se registra en el log y en la consola. Las etiquetas ID3 dentro del MP3 también usan el título limpio.
+
+</details>
+
+<details>
+<summary><strong>¿Por qué las carpetas de artistas no tienen tildes?</strong></summary>
+
+La función `normalize_folder_name()` elimina tildes y diéresis únicamente en los nombres de carpeta para evitar duplicados (por ejemplo, "Bebé" y "Bebe" irían a la misma carpeta). Las etiquetas ID3 dentro de los MP3 conservan los caracteres originales con tildes.
+
+</details>
+
+<details>
 <summary><strong>La columna "Genres" no aparece en mi CSV</strong></summary>
 
 La columna `Genres` no siempre está en la exportación de Exportify. Si no está presente, los gráficos de géneros no aparecerán pero la app funciona normalmente. Para obtenerla, enriquece el CSV con el endpoint `/artists` de la Spotify Web API.
@@ -351,6 +412,6 @@ No. En ejecución local (sin Docker), la app detecta automáticamente la carpeta
 
 <div align="center">
 
-**Sello de Gato Music** — Hecho con 🐱 y Python
+**Sello de Gato Music V1.0** — Hecho con 🐱 y Python
 
 </div>

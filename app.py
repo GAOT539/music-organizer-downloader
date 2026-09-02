@@ -4,6 +4,7 @@ import plotly.express as px
 import subprocess
 import os
 import re
+import unicodedata
 import io
 import time
 import threading
@@ -66,8 +67,6 @@ if os.path.exists(LOGO_PATH):
 
 st.set_page_config(page_title="Sello de Gato Music", page_icon=page_icon, layout="wide")
 
-# Ruta base por defecto: carpeta nativa Música del SO.
-# Dentro de Docker (/app/output existe como mount point) se usa esa ruta.
 _DOCKER_OUTPUT = "/app/output"
 if os.path.isdir(_DOCKER_OUTPUT):
     _DEFAULT_MUSIC_DIR = _DOCKER_OUTPUT
@@ -101,6 +100,37 @@ def is_valid_mp3(file_path):
 def sanitize_name(name):
     clean = re.sub(r'[\\/*?:"<>|]', "", str(name)).strip()
     return clean if clean else ""
+
+def normalize_folder_name(name):
+    """Elimina tildes, diéresis y marcas diacríticas para nombres de carpeta.
+    Evita duplicados como 'Júan'/'Juan' o 'Bebé'/'Bebe'.
+    Solo para rutas del sistema de archivos; las etiquetas ID3 conservan los originales."""
+    nfkd = unicodedata.normalize('NFD', str(name))
+    return ''.join(c for c in nfkd if unicodedata.category(c) != 'Mn')
+
+_TITLE_LABEL_RE = re.compile(
+    r'\s*[\(\[]'
+    r'(?:'
+    r'(?:video|audio)\s+oficial'
+    r'|official\s+(?:video|audio|music\s+video|lyric\s+video)'
+    r'|lyric(?:s)?\s+video'
+    r'|video\s+lyric'
+    r'|visuali[sz]er'
+    r'|remastered(?:\s+\d{4})?'
+    r'|hd|hq'
+    r')'
+    r'[\)\]]',
+    re.IGNORECASE,
+)
+
+def clean_track_title(title):
+    """Elimina etiquetas de video oficiales del título.
+    Ej: 'Canción (Video Oficial)' → ('Canción', True).
+    Retorna (cleaned_title, was_modified)."""
+    cleaned = _TITLE_LABEL_RE.sub('', title).strip()
+    if not cleaned:
+        return title, False
+    return cleaned, cleaned != title
 
 def get_primary_artist(artist_string):
     raw = str(artist_string).strip()
@@ -139,8 +169,6 @@ def embed_lyrics_into_mp3(mp3_path, lyrics_text):
         audio.add(SYLT(encoding=Encoding.UTF8, lang='eng', format=2, type=1, text=sylt_pairs))
 
     audio.save(mp3_path)
-
-
 
 
 def fetch_itunes_metadata(track_name, artist_name):
@@ -281,11 +309,12 @@ def run_download_job(df_sorted, root_target_dir, log_file_path, engine_mode, env
     def _process_single_track(task_idx, idx, row):
         """Procesa una pista: descarga → 4 capas de validación → metadata → renombrado.
         Usa prefijo _tmp_{task_idx}_ para aislar archivos entre hilos.
-        Retorna (status, base_filename, reason, row_dict)."""
+        Retorna (status, base_filename, reason, row_dict, title_cleaned)."""
         if cancel_ctrl.is_cancelled:
-            return 'cancelled', '', '', None
+            return 'cancelled', '', '', None, False
 
-        track_name     = sanitize_name(row.get('Track Name', 'Desconocido'))
+        track_name_raw = sanitize_name(row.get('Track Name', 'Desconocido'))
+        track_name, title_was_cleaned = clean_track_title(track_name_raw)
         full_artist    = sanitize_name(row.get('Artist Name(s)', 'Desconocido'))
         primary_artist = row.get('Clean_Primary_Artist', 'Varios Artistas')
         album_name     = sanitize_name(row.get('Album Name', ''))
@@ -296,9 +325,9 @@ def run_download_job(df_sorted, root_target_dir, log_file_path, engine_mode, env
             if track_uri.startswith('spotify:track:') else track_uri
         )
 
-        target_folder = os.path.join(root_target_dir, primary_artist)
+        folder_artist = normalize_folder_name(primary_artist)
+        target_folder = os.path.join(root_target_dir, folder_artist)
         os.makedirs(target_folder, exist_ok=True)
-
 
         base_filename  = format_track_filename(track_name, album_name, full_artist)
         final_mp3_path = os.path.join(target_folder, f"{base_filename}.mp3")
@@ -309,13 +338,15 @@ def run_download_job(df_sorted, root_target_dir, log_file_path, engine_mode, env
         current_num = idx + 1
         set_current_track(f"({current_num}/{total_tracks}) {base_filename}")
         update_console(f"\n[INFO] ({current_num}/{total_tracks}) {primary_artist} -> {base_filename}")
+        if title_was_cleaned:
+            update_console(f" 🧹 Título limpiado: '{track_name_raw}' → '{track_name}'")
 
         # Capa 1: Omisión robusta — existencia + tamaño > 100 KB + validez MP3
         if os.path.exists(final_mp3_path) and os.path.getsize(final_mp3_path) > 100_000:
             if is_valid_mp3(final_mp3_path):
                 update_console(f"✔ Omitido (Ya existe y es válido): {base_filename}")
                 write_log(f"OMITIDO | {base_filename}")
-                return 'skipped', base_filename, '', None
+                return 'skipped', base_filename, '', None, title_was_cleaned
             else:
                 update_console(f"⚠ Archivo corrupto detectado, eliminando para re-descargar: {base_filename}")
                 try:
@@ -324,7 +355,7 @@ def run_download_job(df_sorted, root_target_dir, log_file_path, engine_mode, env
                     pass
 
         if cancel_ctrl.is_cancelled:
-            return 'cancelled', base_filename, '', None
+            return 'cancelled', base_filename, '', None, False
 
         success = False
         reason  = ""
@@ -392,38 +423,64 @@ def run_download_job(df_sorted, root_target_dir, log_file_path, engine_mode, env
                 update_console(f" \U0001f5d1 Residuos eliminados: {', '.join(removed)}")
 
         def embed_post_process(mp3_path):
-            """Post-procesado: incrusta metadatos ID3 (iTunes > CSV) + letras USLT/SYLT."""
+            """Post-procesado: incrusta metadatos ID3 (iTunes > CSV > yt-dlp) + letras USLT/SYLT.
+            Fusión jerárquica: rellena campos vacíos buscando en la siguiente fuente."""
+            # --- Capa 3: Leer metadatos pre-existentes de yt-dlp (antes de sobrescribir) ---
+            ytdlp_meta = {}
+            try:
+                _existing_tags = ID3(mp3_path)
+                for _tag_id, _key in [("TIT2", "title"), ("TPE1", "artist"), ("TALB", "album"),
+                                       ("TDRC", "year"), ("TCON", "genre")]:
+                    _val = _existing_tags.get(_tag_id)
+                    if _val:
+                        _text = str(_val)
+                        if _text and _text.strip().lower() not in ('', 'none', 'nan'):
+                            ytdlp_meta[_key] = _text.strip()
+            except Exception:
+                pass
+            if ytdlp_meta:
+                update_console(f" ℹ yt-dlp tags leídos: {', '.join(ytdlp_meta.keys())}")
+
+            # --- Capa 1: iTunes API ---
             update_console(" ▶ Consultando iTunes API para metadatos HD...")
             itunes = fetch_itunes_metadata(track_name, primary_artist)
 
             if itunes:
                 update_console(
-                    f" \u2714 iTunes: '{itunes.get('title')}' "
+                    f" ✔ iTunes: '{itunes.get('title')}' "
                     f"- {itunes.get('artist')} "
                     f"[{itunes.get('album')}] "
                     f"({itunes.get('year')})"
                 )
             else:
-                update_console(" \u26a0 iTunes no encontro la cancion — usando datos del CSV")
+                update_console(" ⚠ iTunes no encontró la canción — buscando en CSV / yt-dlp")
 
-            # Prioridad: iTunes > CSV
-            final_title  = (itunes or {}).get("title")  or track_name
-            final_artist = (itunes or {}).get("artist") or full_artist
-            final_album  = (itunes or {}).get("album")  or album_name
+            # Fusión jerárquica: 1º iTunes → 2º CSV → 3º yt-dlp
+            final_title  = (itunes or {}).get("title")  or track_name  or ytdlp_meta.get("title", "")
+            final_artist = (itunes or {}).get("artist") or full_artist  or ytdlp_meta.get("artist", "")
+            final_album  = (itunes or {}).get("album")  or album_name  or ytdlp_meta.get("album", "")
             final_genre  = (itunes or {}).get("genre")
             final_year   = (itunes or {}).get("year")
 
+            # Género: iTunes → CSV → yt-dlp
             if not final_genre:
                 genres_raw = str(row.get('Genres', '') or '').strip()
                 if genres_raw and genres_raw.lower() not in ('nan', 'none', ''):
                     final_genre = genres_raw.split(',')[0].strip()
+            if not final_genre:
+                final_genre = ytdlp_meta.get("genre")
 
+            # Año: iTunes → CSV → yt-dlp
             if not final_year:
                 final_year = str(
                     row.get('Release Year', '') or row.get('Release Date', '') or ''
                 ).strip()[:4]
                 if not final_year.isdigit():
                     final_year = None
+            if not final_year:
+                _yt_year = (ytdlp_meta.get("year") or "")[:4]
+                if _yt_year and _yt_year.isdigit():
+                    final_year = _yt_year
 
             try:
                 try:
@@ -494,9 +551,13 @@ def run_download_job(df_sorted, root_target_dir, log_file_path, engine_mode, env
                     ))
 
                 tags.save(mp3_path)
+                _src_parts = []
+                if itunes: _src_parts.append('iTunes')
+                _src_parts.append('CSV')
+                if ytdlp_meta: _src_parts.append('yt-dlp')
                 update_console(
-                    " \u2714 Metadata ID3 completa "
-                    f"({'iTunes+CSV' if itunes else 'solo CSV'}): "
+                    " ✔ Metadata ID3 completa "
+                    f"({'+'.join(_src_parts)}): "
                     f"{final_title} / {final_artist} / {final_album}"
                 )
 
@@ -542,6 +603,17 @@ def run_download_job(df_sorted, root_target_dir, log_file_path, engine_mode, env
                         return True, None
                     info = entries[0]
 
+                # --- Filtro Anti-Karaoke / Instrumental ---
+                _video_title = (info.get("title") or "")
+                _karaoke_re = re.compile(r'\b(karaoke|instrumental|pista|cover)\b', re.IGNORECASE)
+                _csv_has_keyword = bool(_karaoke_re.search(track_name))
+                _yt_has_keyword = bool(_karaoke_re.search(_video_title))
+                if not _csv_has_keyword and _yt_has_keyword:
+                    update_console(
+                        " ✖ yt-dlp: descartado (Versión Karaoke/Instrumental detectada)"
+                    )
+                    return False, None
+
                 web_dur_s = info.get("duration")
                 if web_dur_s is None:
                     return True, None
@@ -570,10 +642,9 @@ def run_download_job(df_sorted, root_target_dir, log_file_path, engine_mode, env
                 )
                 return True, None
 
-        # === MOTORES DE DESCARGA ===
         if "yt-dlp" in engine_mode:
             if cancel_ctrl.is_cancelled:
-                return 'cancelled', base_filename, '', None
+                return 'cancelled', base_filename, '', None, False
 
             search_query = f'ytsearch1:"{primary_artist}" "{track_name}" "Provided to YouTube" OR Topic'
 
@@ -625,7 +696,7 @@ def run_download_job(df_sorted, root_target_dir, log_file_path, engine_mode, env
 
         if not success and "spotdl" in engine_mode:
             if cancel_ctrl.is_cancelled:
-                return 'cancelled', base_filename, '', None
+                return 'cancelled', base_filename, '', None, False
 
             update_console(" -> Probando spotdl...")
             cmd_spotdl = [
@@ -662,9 +733,9 @@ def run_download_job(df_sorted, root_target_dir, log_file_path, engine_mode, env
                 pass
 
         if success:
-            return 'success', base_filename, '', None
+            return 'success', base_filename, '', None, title_was_cleaned
         else:
-            return 'error', base_filename, reason, row.to_dict()
+            return 'error', base_filename, reason, row.to_dict(), title_was_cleaned
 
     def _worker_wrapper(task_idx, idx, row):
         """Inyecta el ScriptRunContext de Streamlit en el hilo del pool.
@@ -691,7 +762,7 @@ def run_download_job(df_sorted, root_target_dir, log_file_path, engine_mode, env
         cancelled_logged = False
         for future in as_completed(futures):
             try:
-                status, base_filename, reason, row_dict = future.result()
+                status, base_filename, reason, row_dict, title_cleaned = future.result()
             except Exception as exc:
                 update_console(f"✖ Error inesperado en hilo worker: {exc}")
                 update_progress()
@@ -708,9 +779,10 @@ def run_download_job(df_sorted, root_target_dir, log_file_path, engine_mode, env
             if status in ('success', 'skipped'):
                 increment_success()
                 if status == 'success':
-                    update_console(f"✔ EXITOSO: {base_filename}.mp3")
-
-                    write_log(f"ÉXITO | {base_filename}")
+                    _clean_note = " (título limpio)" if title_cleaned else ""
+                    update_console(f"✔ EXITOSO: {base_filename}.mp3{_clean_note}")
+                    _log_detail = " | Título modificado: se limpió etiqueta de video" if title_cleaned else ""
+                    write_log(f"ÉXITO | {base_filename}{_log_detail}")
 
             elif status == 'error':
                 update_console(f"✖ ERROR: {base_filename} -- {reason}")
@@ -936,6 +1008,8 @@ elif menu_selection == "downloads":
         _effective_base = st.session_state["download_base_path"]
         st.write("📌 **Reglas de guardado:**")
         st.write(f"- Ruta: `{_effective_base}/{sanitize_name(custom_root_folder)}/{{ArtistaPrincipal}}/`")
+        if _effective_base.rstrip("/") == "/app/output":
+            st.info("📁 Ruta: /app/output/... (Mapeado a tu carpeta local de Música a través de Docker)")
         st.write("- Archivo: `NombreCancion, Album, Artista.mp3`")
 
         download_running = st.session_state["download_state"]["running"]
@@ -971,7 +1045,6 @@ elif menu_selection == "downloads":
             cancel_ctrl = st.session_state["download_control"]
             cancel_ctrl.reset()
 
-            # Calcular rutas efectivas según lo que el usuario configuró en la UI
             effective_base = st.session_state["download_base_path"]
             os.makedirs(effective_base, exist_ok=True)
             log_file_path = os.path.join(effective_base, "registro_descargas.txt")
@@ -988,7 +1061,6 @@ elif menu_selection == "downloads":
             root_target_dir = os.path.join(effective_base, sanitize_name(custom_root_folder))
             os.makedirs(root_target_dir, exist_ok=True)
 
-            # Guardar log_file_path en session_state para acceso desde la UI de registro
             st.session_state["log_file_path"] = log_file_path
 
             env_vars = os.environ.copy()
