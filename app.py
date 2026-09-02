@@ -27,6 +27,30 @@ except ImportError:
     except ImportError:
         add_script_run_ctx = None
 
+
+# --- ESTADO DE CANCELACIÓN THREAD-SAFE ---
+class DownloadControl:
+    """Objeto compartido entre el hilo principal (UI) y el hilo de descarga.
+    Usar una clase dedicada evita los problemas de sincronización de
+    st.session_state, que no se propaga de forma fiable a hilos secundarios."""
+    def __init__(self):
+        self._cancel = threading.Event()
+
+    def request_cancel(self):
+        self._cancel.set()
+
+    def reset(self):
+        self._cancel.clear()
+
+    @property
+    def is_cancelled(self):
+        return self._cancel.is_set()
+
+
+# Instancia global — compartida entre reruns de Streamlit e hilos
+if "download_control" not in st.session_state:
+    st.session_state["download_control"] = DownloadControl()
+
 # --- CONFIGURACIÓN DE PÁGINA Y LOGO ---
 LOGO_PATH = "logo.png"
 page_icon = "🎵"
@@ -59,6 +83,21 @@ if "download_state" not in st.session_state:
         "failed_songs": [],
         "current_track": "",
     }
+
+# --- VALIDACIÓN ANTI-CORRUPCIÓN MP3 ---
+def is_valid_mp3(file_path):
+    """Valida que un archivo MP3 sea estructuralmente correcto usando Mutagen.
+    Retorna True solo si se puede abrir y tiene una duración válida (> 0).
+    Retorna False ante cualquier excepción (HeaderNotFoundError, etc.) o duración inválida."""
+    try:
+        audio = MP3(file_path)
+        duration = audio.info.length
+        if duration is None or duration <= 0:
+            return False
+        return True
+    except Exception:
+        return False
+
 
 # --- FUNCIONES DE PROCESAMIENTO ---
 def sanitize_name(name):
@@ -238,11 +277,12 @@ def process_dataframe(df):
 
 
 # --- FUNCIÓN PRINCIPAL DE DESCARGA (EJECUTADA EN HILO SECUNDARIO) ---
-def run_download_job(df_sorted, root_target_dir, engine_mode, env_vars):
+def run_download_job(df_sorted, root_target_dir, engine_mode, env_vars, cancel_ctrl):
     """
     Ejecuta el bucle de descarga en un hilo secundario.
     Escribe el progreso en st.session_state['download_state'] para que
     la UI pueda leerlo desde cualquier pantalla de la app.
+    cancel_ctrl: DownloadControl — objeto thread-safe para detectar cancelación.
     """
     state = st.session_state["download_state"]
     total_tracks = len(df_sorted)
@@ -277,6 +317,18 @@ def run_download_job(df_sorted, root_target_dir, engine_mode, env_vars):
         return proc.returncode == 0, "\n".join(out)
 
     for idx, row in df_sorted.iterrows():
+        # --- Comprobación de cancelación segura (thread-safe) ---
+        if cancel_ctrl.is_cancelled:
+            _cancel_track = state.get("current_track", f"pista {idx + 1}")
+            update_console(f"\n🛑 Proceso cancelado por el usuario. Puedes reanudar cuando desees.")
+            # Cierre seguro del archivo de registro
+            try:
+                with open(LOG_FILE_PATH, 'a', encoding='utf-8') as _lf:
+                    _lf.write(f"CANCELADO | Proceso detenido por el usuario en la canción {_cancel_track}\n")
+            except Exception:
+                pass
+            break
+
         track_name     = sanitize_name(row.get('Track Name', 'Desconocido'))
         full_artist    = sanitize_name(row.get('Artist Name(s)', 'Desconocido'))
         primary_artist = row.get('Clean_Primary_Artist', 'Varios Artistas')
@@ -298,18 +350,26 @@ def run_download_job(df_sorted, root_target_dir, engine_mode, env_vars):
         state["current_track"] = f"({current_num}/{total_tracks}) {base_filename}"
         update_console(f"\n[INFO] ({current_num}/{total_tracks}) {primary_artist} -> {base_filename}")
 
-        # --- Mejora 3: Omisión Robusta — verificar existencia y tamaño >100 KB ---
+        # --- Mejora 3: Omisión Robusta — verificar existencia, tamaño >100 KB y validez MP3 ---
         if os.path.exists(final_mp3_path) and os.path.getsize(final_mp3_path) > 100_000:
-            update_console(f"✔ Omitido (Ya existe): {base_filename}")
-            state["success_count"] += 1
-            state["progress"] = current_num / total_tracks
-            # --- Registro persistente: canción omitida ---
-            try:
-                with open(LOG_FILE_PATH, 'a', encoding='utf-8') as _lf:
-                    _lf.write(f"OMITIDO | {base_filename}\n")
-            except Exception:
-                pass
-            continue
+            if is_valid_mp3(final_mp3_path):
+                update_console(f"✔ Omitido (Ya existe y es válido): {base_filename}")
+                state["success_count"] += 1
+                state["progress"] = current_num / total_tracks
+                # --- Registro persistente: canción omitida ---
+                try:
+                    with open(LOG_FILE_PATH, 'a', encoding='utf-8') as _lf:
+                        _lf.write(f"OMITIDO | {base_filename}\n")
+                except Exception:
+                    pass
+                continue
+            else:
+                # Archivo existe pero está corrupto: eliminar y re-descargar
+                update_console(f"⚠ Archivo corrupto detectado, eliminando para re-descargar: {base_filename}")
+                try:
+                    os.remove(final_mp3_path)
+                except OSError:
+                    pass
 
         success = False
         reason  = ""
@@ -361,10 +421,10 @@ def run_download_job(df_sorted, root_target_dir, engine_mode, env_vars):
 
             real_s = audio_info.info.length
             diff   = abs(real_s - expected_duration_s)
-            if diff > 15:
+            if diff > 35:
                 update_console(
                     f" \u2716 Duracion invalida: real={real_s:.1f}s "
-                    f"esperada={expected_duration_s:.1f}s (delta={diff:.1f}s > 15s) "
+                    f"esperada={expected_duration_s:.1f}s (delta={diff:.1f}s > 35s) "
                     f"-- archivo eliminado"
                 )
                 try:
@@ -598,11 +658,11 @@ def run_download_job(df_sorted, root_target_dir, engine_mode, env_vars):
                 web_dur_s = float(web_dur_s)
                 diff = abs(web_dur_s - expected_duration_s)
 
-                if diff > 20:
+                if diff > 40:
                     update_console(
                         f" \u2716 Descartado (El resultado web es un corte/teaser de "
                         f"{web_dur_s:.0f}s, esperado ~{expected_duration_s:.0f}s, "
-                        f"delta={diff:.0f}s > 20s)"
+                        f"delta={diff:.0f}s > 40s)"
                     )
                     return False, web_dur_s
 
@@ -624,7 +684,7 @@ def run_download_job(df_sorted, root_target_dir, engine_mode, env_vars):
         # 1. MOTOR yt-dlp                                                     #
         # ------------------------------------------------------------------ #
         if "yt-dlp" in engine_mode:
-            search_query = f"ytsearch1:{primary_artist} - {track_name} Audio"
+            search_query = f'ytsearch1:"{primary_artist}" "{track_name}" "Provided to YouTube" OR Topic'
 
             # --- Capa 3: Pre-verificación web antes de descargar ---
             web_ok, web_dur = verify_web_duration(search_query)
@@ -642,7 +702,13 @@ def run_download_job(df_sorted, root_target_dir, engine_mode, env_vars):
                 # --audio-quality 0 = mejor calidad VBR (equivalente a ~320 kbps)
                 cmd_ytdlp = [
                     "yt-dlp", search_query,
-                    "-x", "--audio-format", "mp3",
+                    "--retries", "5",
+                    "--fragment-retries", "5",
+                    "--socket-timeout", "15",
+                    "--abort-on-error",
+                    "--ignore-errors",
+                    "--extract-audio",
+                    "--audio-format", "mp3",
                     "--audio-quality", "0",
                     "--embed-thumbnail",
                     "--no-playlist",
@@ -934,17 +1000,49 @@ elif menu_selection == "downloads":
 
         # Botón deshabilitado si ya hay descarga activa
         download_running = st.session_state["download_state"]["running"]
-        start_download = st.button(
-            "🚀 Iniciar Descarga Unificada" if not download_running else "⏳ Descarga en Curso...",
-            type="primary",
-            use_container_width=True,
-            disabled=download_running
-        )
+        btn_col1, btn_col2 = st.columns([3, 1])
+        with btn_col1:
+            # Texto dinámico: si ya se completó o canceló antes, mostrar "Reanudar"
+            if download_running:
+                _btn_label = "⏳ Descarga en Curso..."
+            elif st.session_state["download_state"]["done"]:
+                _btn_label = "▶️ Iniciar / Reanudar Descarga"
+            else:
+                _btn_label = "🚀 Iniciar / Reanudar Descarga"
+            start_download = st.button(
+                _btn_label,
+                type="primary",
+                use_container_width=True,
+                disabled=download_running
+            )
+        with btn_col2:
+            cancel_download = st.button(
+                "🛑 Cancelar Descarga",
+                use_container_width=True,
+                disabled=not download_running,
+                type="secondary",
+            )
+            if cancel_download:
+                st.session_state["download_control"].request_cancel()
+                st.toast("🛑 Cancelación solicitada. El proceso se detendrá tras la pista actual.", icon="🛑")
 
     if start_download:
         if "spotdl" in engine_mode and (not spotipy_client_id or not spotipy_client_secret):
             st.error("⚠️ Debes ingresar tu Client ID y Client Secret de Spotify para poder usar esta estrategia.")
         else:
+            # Resetear bandera de cancelación (thread-safe) al iniciar nueva descarga
+            cancel_ctrl = st.session_state["download_control"]
+            cancel_ctrl.reset()
+
+            # Registrar reanudación en consola y log
+            _resume_msg = "REANUDADO | Retomando proceso de descarga..."
+            st.session_state["download_state"]["log_lines"].insert(0, f"\n▶️ {_resume_msg}")
+            try:
+                with open(LOG_FILE_PATH, 'a', encoding='utf-8') as _lf:
+                    _lf.write(f"{_resume_msg}\n")
+            except Exception:
+                pass
+
             df_sorted = df.sort_values(by=['Clean_Primary_Artist', 'Track Name']).reset_index(drop=True)
             root_target_dir = os.path.join(BASE_OUTPUT_DIR, sanitize_name(custom_root_folder))
             os.makedirs(root_target_dir, exist_ok=True)
@@ -954,10 +1052,10 @@ elif menu_selection == "downloads":
                 env_vars["SPOTIPY_CLIENT_ID"] = spotipy_client_id
                 env_vars["SPOTIPY_CLIENT_SECRET"] = spotipy_client_secret
 
-            # Lanzar hilo secundario
+            # Lanzar hilo secundario con referencia al controlador de cancelación
             job_thread = threading.Thread(
                 target=run_download_job,
-                args=(df_sorted, root_target_dir, engine_mode, env_vars),
+                args=(df_sorted, root_target_dir, engine_mode, env_vars, cancel_ctrl),
                 daemon=True
             )
             if add_script_run_ctx is not None:
