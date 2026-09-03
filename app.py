@@ -975,25 +975,27 @@ elif menu_selection == "downloads":
     col_conf1, col_conf2 = st.columns([1, 1])
 
     with col_conf1:
-        download_base_path = st.text_input(
+        host_dir_visual = os.getenv("HOST_MUSIC_DIR", "Ruta_Windows_No_Definida")
+        st.text_input(
             "📂 Ruta Base de Descarga:",
-            value=st.session_state["download_base_path"],
-            help="Carpeta raíz donde se guardarán los MP3. "
-                 "Por defecto apunta a la carpeta Música de tu sistema.",
+            value=host_dir_visual,
+            help="Carpeta raíz donde se guardarán los MP3 (Ruta en tu máquina local).",
+            disabled=True
         )
+        download_base_path = "/app/output"
         st.session_state["download_base_path"] = download_base_path
 
         custom_root_folder = st.text_input("📁 Carpeta Raíz (subcarpeta):", value="Mi Musica")
         engine_mode = st.selectbox(
             "Estrategia de Motores:",
-            ["Solo yt-dlp (Recomendado y rápido)", "Cascada Automática (spotdl ➔ yt-dlp)", "Solo spotdl"]
+            ["Solo yt-dlp (Recomendado y rápido)", "Cascada Automática (spotdl ➔ yt-dlp)", "Solo spotdl"],
+            disabled=True
         )
 
-        max_workers = st.slider(
-            "🧵 Hilos de descarga simultáneos",
-            min_value=1, max_value=5, value=2,
-            help="Más hilos = más rápido, pero consume más ancho de banda y CPU. "
-                 "Valor recomendado: 2-3 para conexiones estables."
+        max_workers = st.selectbox(
+            "🧵 Hilos de descarga simultáneos", 
+            options=[1, 2, 3, 4, 5], 
+            index=1
         )
 
         spotipy_client_id = ""
@@ -1006,10 +1008,11 @@ elif menu_selection == "downloads":
 
     with col_conf2:
         _effective_base = st.session_state["download_base_path"]
-        st.write("📌 **Reglas de guardado:**")
-        st.write(f"- Ruta: `{_effective_base}/{sanitize_name(custom_root_folder)}/{{ArtistaPrincipal}}/`")
+        host_dir_visual = os.getenv("HOST_MUSIC_DIR", "Ruta_Windows_No_Definida")
+        st.write("📌 **Reglas de guardado (Preview):**")
+        st.write(f"- Ruta: `{host_dir_visual}/{sanitize_name(custom_root_folder)}/{{ArtistaPrincipal}}/`")
         if _effective_base.rstrip("/") == "/app/output":
-            st.info("📁 Ruta: /app/output/... (Mapeado a tu carpeta local de Música a través de Docker)")
+            st.info("📁 Ruta interna: /app/output/... (Mapeado a tu carpeta local de Música a través de Docker)")
         st.write("- Archivo: `NombreCancion, Album, Artista.mp3`")
 
         download_running = st.session_state["download_state"]["running"]
