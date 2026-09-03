@@ -9,6 +9,7 @@ import io
 import time
 import threading
 import pathlib
+import sqlite3
 import requests
 import syncedlyrics
 from PIL import Image
@@ -145,6 +146,233 @@ def format_track_filename(track_name, album_name, full_artist):
         return f"{t_name}, {art_name}"
     else:
         return f"{t_name}, {a_name}, {art_name}"
+
+
+_MUSIC_CLEANUP_DB = (
+    os.path.join("/app/data", "registro_musicas.db")
+    if os.path.isdir("/app/data")
+    else "registro_musicas.db"
+)
+_MUSIC_CLEANUP_TARGET = os.path.join("/app/output", "Mi Musica")
+
+
+def _initialize_music_cleanup_db(connection):
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS Carpetas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nombre_carpeta TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS Canciones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nombre_archivo TEXT NOT NULL,
+            carpeta_id INTEGER NOT NULL,
+            FOREIGN KEY (carpeta_id) REFERENCES Carpetas(id)
+        );
+        """
+    )
+    connection.commit()
+
+
+def _load_music_cleanup_rows():
+    with sqlite3.connect(_MUSIC_CLEANUP_DB) as connection:
+        _initialize_music_cleanup_db(connection)
+        return connection.execute(
+            """
+            SELECT Carpetas.nombre_carpeta AS Carpeta,
+                   Canciones.nombre_archivo AS Archivo
+            FROM Canciones
+            JOIN Carpetas ON Carpetas.id = Canciones.carpeta_id
+            ORDER BY Carpetas.nombre_carpeta, Canciones.nombre_archivo
+            """
+        ).fetchall()
+
+
+def _populate_music_cleanup_db(progress_bar):
+    folder_entries = []
+    song_entries = []
+    if os.path.isdir(_MUSIC_CLEANUP_TARGET):
+        for current_root, directories, filenames in os.walk(_MUSIC_CLEANUP_TARGET):
+            if os.path.abspath(current_root) == os.path.abspath(_MUSIC_CLEANUP_TARGET):
+                continue
+            folder_name = os.path.basename(current_root)
+            folder_entries.append(folder_name)
+            song_entries.extend(
+                (folder_name, os.path.splitext(filename)[0])
+                for filename in filenames
+                if filename.lower().endswith(".mp3")
+            )
+
+    total_entries = len(folder_entries) + len(song_entries)
+    completed_entries = 0
+    with sqlite3.connect(_MUSIC_CLEANUP_DB) as connection:
+        _initialize_music_cleanup_db(connection)
+        connection.execute("DELETE FROM Canciones")
+        connection.execute("DELETE FROM Carpetas")
+        folder_ids = {}
+        for folder_name in folder_entries:
+            cursor = connection.execute(
+                "INSERT INTO Carpetas (nombre_carpeta) VALUES (?)",
+                (folder_name,),
+            )
+            folder_ids[folder_name] = cursor.lastrowid
+            completed_entries += 1
+            progress_bar.progress(completed_entries / total_entries if total_entries else 1.0)
+
+        for folder_name, filename in song_entries:
+            connection.execute(
+                "INSERT INTO Canciones (nombre_archivo, carpeta_id) VALUES (?, ?)",
+                (filename, folder_ids[folder_name]),
+            )
+            completed_entries += 1
+            progress_bar.progress(completed_entries / total_entries if total_entries else 1.0)
+        connection.commit()
+
+    return _load_music_cleanup_rows()
+
+
+def _render_music_cleanup_rows(rows):
+    songs_by_folder = {}
+    for folder_name, filename in rows:
+        songs_by_folder.setdefault(folder_name, []).append(filename)
+
+    with st.container(height=500):
+        for folder_name, filenames in songs_by_folder.items():
+            with st.expander(f"📁 {folder_name}"):
+                for filename in filenames:
+                    st.markdown(f"- {filename}")
+
+
+def render_music_cleanup_module():
+    with st.expander("🧹 Limpieza de carpeta"):
+        database_has_data = False
+        if os.path.exists(_MUSIC_CLEANUP_DB):
+            try:
+                database_has_data = bool(_load_music_cleanup_rows())
+            except sqlite3.Error as error:
+                st.warning(f"No se pudo leer la base de datos: {error}")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            generate_database = st.button(
+                "Generar Base de Datos",
+                key="generate_music_database",
+                disabled=database_has_data,
+                use_container_width=True,
+            )
+        with col2:
+            refresh_database = st.button(
+                "Releer archivos y actualizar BD",
+                key="refresh_music_database",
+                use_container_width=True,
+            )
+
+        if generate_database or refresh_database:
+            progress_bar = st.progress(0.0)
+            rows = _populate_music_cleanup_db(progress_bar)
+            if generate_database:
+                st.success("Base de datos generada correctamente.")
+            else:
+                st.success("Base de datos actualizada correctamente.")
+            _render_music_cleanup_rows(rows)
+        elif not database_has_data:
+            st.info("No hay registros. Genera la base de datos para indexar los MP3.")
+        else:
+            rows = _load_music_cleanup_rows()
+            _render_music_cleanup_rows(rows)
+
+    hay_datos = database_has_data
+    with st.expander("🛠️ Fusión y Normalización de Carpetas"):
+        st.write(
+            "Busca carpetas con nombres equivalentes, combina sus archivos "
+            "y elimina los MP3 duplicados."
+        )
+
+        fusionar_carpetas = st.button(
+            "🔍 Buscar y fusionar carpetas similares",
+            disabled=not hay_datos,
+        )
+        if not hay_datos:
+            st.caption("⚠️ Relee los archivos primero para habilitar la fusión.")
+
+        if fusionar_carpetas:
+            import shutil
+
+            def _normalizar_texto(texto):
+                return (
+                    unicodedata.normalize("NFKD", texto)
+                    .encode("ASCII", "ignore")
+                    .decode("utf-8")
+                    .title()
+                )
+
+            logs = []
+            carpetas_por_nombre = {}
+            if os.path.isdir(_MUSIC_CLEANUP_TARGET):
+                for nombre_carpeta in os.listdir(_MUSIC_CLEANUP_TARGET):
+                    ruta_carpeta = os.path.join(_MUSIC_CLEANUP_TARGET, nombre_carpeta)
+                    if os.path.isdir(ruta_carpeta):
+                        nombre_normalizado = _normalizar_texto(nombre_carpeta)
+                        carpetas_por_nombre.setdefault(nombre_normalizado, []).append(
+                            (nombre_carpeta, ruta_carpeta)
+                        )
+
+            for nombre_normalizado, variantes in carpetas_por_nombre.items():
+                if len(variantes) < 2:
+                    continue
+
+                carpeta_destino = os.path.join(
+                    _MUSIC_CLEANUP_TARGET,
+                    nombre_normalizado,
+                )
+                os.makedirs(carpeta_destino, exist_ok=True)
+
+                for nombre_carpeta, ruta_variante in variantes:
+                    if os.path.abspath(ruta_variante) == os.path.abspath(carpeta_destino):
+                        continue
+
+                    os.makedirs(carpeta_destino, exist_ok=True)
+                    archivos_destino = {
+                        _normalizar_texto(os.path.basename(archivo)): os.path.basename(archivo)
+                        for archivo in os.listdir(carpeta_destino)
+                        if os.path.isfile(os.path.join(carpeta_destino, archivo))
+                        and archivo.lower().endswith(".mp3")
+                    }
+                    for archivo_variante in os.listdir(ruta_variante):
+                        ruta_archivo_variante = os.path.join(ruta_variante, archivo_variante)
+                        if not (
+                            os.path.isfile(ruta_archivo_variante)
+                            and archivo_variante.lower().endswith(".mp3")
+                        ):
+                            continue
+
+                        nombre_archivo_normalizado = _normalizar_texto(archivo_variante)
+                        archivo_destino = archivos_destino.get(nombre_archivo_normalizado)
+                        if archivo_destino:
+                            os.remove(ruta_archivo_variante)
+                            logs.append(
+                                f"❌ Archivo eliminado: '{archivo_variante}' "
+                                f"(Similitud con '{archivo_destino}')"
+                            )
+                        else:
+                            shutil.move(ruta_archivo_variante, carpeta_destino)
+                            archivos_destino[nombre_archivo_normalizado] = archivo_variante
+                            logs.append(
+                                f"➡️ Archivo movido: '{archivo_variante}' "
+                                f"-> '{carpeta_destino}'"
+                            )
+
+                    try:
+                        os.rmdir(ruta_variante)
+                        logs.append(f"🗑️ Carpeta eliminada: '{nombre_carpeta}'")
+                    except OSError:
+                        pass
+
+            if logs:
+                with st.container(height=300):
+                    st.code("\n".join(logs), language="bash")
+            else:
+                st.success("No se encontraron carpetas duplicadas.")
 
 def embed_lyrics_into_mp3(mp3_path, lyrics_text):
     """Incrusta letra USLT (plana) y SYLT (sincronizada con timestamps)."""
@@ -809,6 +1037,10 @@ if os.path.exists(LOGO_PATH):
 st.sidebar.title("Configuración Inicial")
 uploaded_file = st.sidebar.file_uploader("📂 Sube tu archivo CSV de Spotify", type=["csv"])
 
+st.title("Sello de Gato Music")
+st.markdown("---")
+render_music_cleanup_module()
+
 if uploaded_file is None:
     st.info("👈 Por favor, sube tu archivo `.csv` en el menú lateral para cargar la aplicación.")
     st.stop()
@@ -851,7 +1083,6 @@ if dl_state["running"] or (dl_state["done"] and dl_state["total"] > 0):
         time.sleep(0.8)
         st.rerun()
 
-st.title("Sello de Gato Music")
 st.markdown("---")
 
 if menu_selection == "dashboard":
