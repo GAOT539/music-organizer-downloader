@@ -6,7 +6,6 @@ import os
 import re
 import unicodedata
 import io
-import time
 import threading
 import pathlib
 import sqlite3
@@ -242,46 +241,41 @@ def _render_music_cleanup_rows(rows):
                 for filename in filenames:
                     st.markdown(f"- {filename}")
 
-
 def render_music_cleanup_module():
     with st.expander("🧹 Limpieza de carpeta"):
-        database_has_data = False
-        if os.path.exists(_MUSIC_CLEANUP_DB):
-            try:
-                database_has_data = bool(_load_music_cleanup_rows())
-            except sqlite3.Error as error:
-                st.warning(f"No se pudo leer la base de datos: {error}")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            generate_database = st.button(
-                "Generar Base de Datos",
-                key="generate_music_database",
-                disabled=database_has_data,
-                use_container_width=True,
-            )
-        with col2:
-            refresh_database = st.button(
-                "Releer archivos y actualizar BD",
-                key="refresh_music_database",
-                use_container_width=True,
-            )
-
-        if generate_database or refresh_database:
-            progress_bar = st.progress(0.0)
-            rows = _populate_music_cleanup_db(progress_bar)
-            if generate_database:
-                st.success("Base de datos generada correctamente.")
-            else:
-                st.success("Base de datos actualizada correctamente.")
-            _render_music_cleanup_rows(rows)
-        elif not database_has_data:
-            st.info("No hay registros. Genera la base de datos para indexar los MP3.")
-        else:
+        try:
             rows = _load_music_cleanup_rows()
-            _render_music_cleanup_rows(rows)
+        except sqlite3.Error as error:
+            rows = []
+            st.warning(f"No se pudo leer la base de datos: {error}")
 
-    hay_datos = database_has_data
+        if st.button("🔄 Escanear y Actualizar Biblioteca"):
+            try:
+                with sqlite3.connect(_MUSIC_CLEANUP_DB) as connection:
+                    _initialize_music_cleanup_db(connection)
+                    connection.execute("DELETE FROM Canciones")
+                    connection.execute("DELETE FROM Carpetas")
+                    connection.commit()
+
+                st.caption("Escaneando la biblioteca y actualizando el registro...")
+                progress_bar = st.progress(0.0, text="Progreso del escaneo: 0%")
+                _populate_music_cleanup_db(progress_bar)
+                st.rerun()
+            except (OSError, sqlite3.Error) as error:
+                st.error(f"No se pudo actualizar la biblioteca: {error}")
+
+        hay_datos = bool(rows) or (
+            os.path.isdir(_MUSIC_CLEANUP_TARGET)
+            and any(
+                os.path.isdir(os.path.join(_MUSIC_CLEANUP_TARGET, nombre))
+                for nombre in os.listdir(_MUSIC_CLEANUP_TARGET)
+            )
+        )
+        if hay_datos:
+            _render_music_cleanup_rows(rows)
+        else:
+            st.info("No hay registros. Escanea la biblioteca para indexar los MP3.")
+
     with st.expander("🛠️ Fusión y Normalización de Carpetas"):
         st.write(
             "Busca carpetas con nombres equivalentes, combina sus archivos "
@@ -290,10 +284,9 @@ def render_music_cleanup_module():
 
         fusionar_carpetas = st.button(
             "🔍 Buscar y fusionar carpetas similares",
-            disabled=not hay_datos,
         )
         if not hay_datos:
-            st.caption("⚠️ Relee los archivos primero para habilitar la fusión.")
+            st.info("No hay datos indexados. La fusión revisará directamente la carpeta de música.")
 
         if fusionar_carpetas:
             import shutil
@@ -1031,6 +1024,148 @@ def run_download_job(df_sorted, root_target_dir, log_file_path, engine_mode, env
     state["done"] = True
 
 
+@st.fragment(run_every="1s")
+def render_download_monitor(show_main=True):
+    dl_state = st.session_state["download_state"]
+
+    if dl_state["running"] or (dl_state["done"] and dl_state["total"] > 0):
+        with st.sidebar:
+            st.markdown("---")
+            if dl_state["running"]:
+                st.markdown("**📥 Descarga en Progreso**")
+            else:
+                st.markdown("**✅ Descarga Finalizada**")
+            if dl_state["total"] > 0:
+                st.progress(dl_state["progress"])
+                completed = int(dl_state["progress"] * dl_state["total"])
+                caption_text = f"{completed}/{dl_state['total']} canciones"
+                if dl_state["running"] and dl_state["current_track"]:
+                    caption_text += f"\n{dl_state['current_track']}"
+                st.caption(caption_text)
+
+    if not show_main or not (dl_state["running"] or (dl_state["done"] and dl_state["total"] > 0)):
+        return
+
+    st.markdown("#### 📟 Consola en Vivo")
+
+    progress_bar = st.progress(dl_state["progress"])
+    completed = int(dl_state["progress"] * dl_state["total"]) if dl_state["total"] > 0 else 0
+    if dl_state["running"]:
+        status_text = f"Procesando ({completed}/{dl_state['total']}): **{dl_state['current_track']}**"
+    else:
+        status_text = f"✅ Completado: {dl_state['success_count']}/{dl_state['total']} canciones"
+    st.caption(status_text)
+
+    escaped_lines = (
+        "\n".join(dl_state["log_lines"])
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    console_html = f"""
+    <div id="console-wrapper" style="
+        background:#0d1117;
+        border:1px solid #30363d;
+        border-radius:8px;
+        padding:12px 16px;
+        height:320px;
+        overflow-y:auto;
+        font-family:'JetBrains Mono','Fira Code','Courier New',monospace;
+        font-size:12.5px;
+        line-height:1.6;
+        color:#e6edf3;
+        white-space:pre-wrap;
+        word-break:break-all;
+    ">{escaped_lines}</div>
+    """
+    st.html(console_html)
+
+    with st.container():
+        st.markdown("#### 📑 Registro de Resultados")
+
+        _filter_col, _spacer = st.columns([2, 5])
+        with _filter_col:
+            log_filter = st.radio(
+                "Filtrar por estado:",
+                options=["Errores", "Éxitos", "Omitidos", "Todos"],
+                index=0,
+                horizontal=True,
+                key="log_filter_radio",
+                label_visibility="collapsed",
+            )
+
+        _lfp = st.session_state.get("log_file_path", "")
+        if not _lfp or not os.path.exists(_lfp):
+            st.info("Aún no hay entradas en el registro. Inicia una descarga para comenzar.")
+        else:
+            prefix_map = {
+                "Errores": "ERROR",
+                "Éxitos": "ÉXITO",
+                "Omitidos": "OMITIDO",
+                "Todos": None,
+            }
+            target_prefix = prefix_map.get(log_filter)
+            rows = []
+            try:
+                with open(_lfp, 'r', encoding='utf-8') as _lf:
+                    for raw_line in _lf:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        parts = [p.strip() for p in line.split('|')]
+                        estado = parts[0] if len(parts) > 0 else ""
+                        cancion = parts[1] if len(parts) > 1 else ""
+                        detalle = parts[2] if len(parts) > 2 else ""
+                        if target_prefix is None or estado.upper().startswith(target_prefix.upper()):
+                            rows.append({"Estado": estado, "Canción": cancion, "Detalle / Error": detalle})
+            except Exception as _read_err:
+                st.warning(f"No se pudo leer el registro: {_read_err}")
+                rows = []
+
+            if rows:
+                _df_log = pd.DataFrame(rows)
+
+                def _style_estado(val):
+                    color_map = {
+                        "ÉXITO": "color: #3fb950; font-weight: 600;",
+                        "ERROR": "color: #f85149; font-weight: 600;",
+                        "OMITIDO": "color: #d29922; font-weight: 600;",
+                    }
+                    for key, style in color_map.items():
+                        if val.upper().startswith(key):
+                            return style
+                    return ""
+
+                st.dataframe(
+                    _df_log.style.map(_style_estado, subset=["Estado"]),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(400, 35 * len(rows) + 38),
+                )
+                st.caption(f"📁 Registro guardado en: `{_lfp}` — {len(rows)} entradas mostradas")
+            else:
+                st.info(f"Sin resultados para el filtro **{log_filter}**.")
+
+    if dl_state["running"]:
+        return
+
+    failed_songs = dl_state["failed_songs"]
+    if failed_songs:
+        df_failed = pd.DataFrame(failed_songs)
+        st.error(f"⚠️ {len(failed_songs)} errores detectados.")
+        cols = [c for c in ['Track Name', 'Artist Name(s)', 'Album Name', 'Error_Reason'] if c in df_failed.columns]
+        st.dataframe(df_failed[cols], use_container_width=True, hide_index=True)
+        st.download_button(
+            "📥 Descargar CSV de Errores",
+            data=df_failed.to_csv(index=False).encode('utf-8'),
+            file_name="errores.csv",
+            mime="text/csv",
+        )
+    else:
+        st.balloons()
+        st.success("✨ ¡Descarga completada sin errores!")
+
+
 if os.path.exists(LOGO_PATH):
     st.sidebar.image(LOGO_PATH, use_container_width=True)
 
@@ -1039,7 +1174,22 @@ uploaded_file = st.sidebar.file_uploader("📂 Sube tu archivo CSV de Spotify", 
 
 st.title("Sello de Gato Music")
 st.markdown("---")
-render_music_cleanup_module()
+try:
+    render_music_cleanup_module()
+except (OSError, sqlite3.Error) as error:
+    st.error(f"No se pudo completar la limpieza o fusión de carpetas: {error}")
+
+with st.expander("💿 Búsqueda de Álbumes"):
+    st.info(
+        "🚧 Módulo en construcción: Próximamente se implementará la búsqueda "
+        "de discografías y álbumes faltantes."
+    )
+
+with st.expander("▶️ Crear playlist en YouTube"):
+    st.info(
+        "🚧 Módulo en construcción: Próximamente se implementará la creación "
+        "automática de la playlist en YouTube Music."
+    )
 
 if uploaded_file is None:
     st.info("👈 Por favor, sube tu archivo `.csv` en el menú lateral para cargar la aplicación.")
@@ -1065,27 +1215,10 @@ if st.sidebar.button("📥 Descargar Músicas", use_container_width=True):
 
 menu_selection = st.session_state["active_view"]
 
-dl_state = st.session_state["download_state"]
-if dl_state["running"] or (dl_state["done"] and dl_state["total"] > 0):
-    st.sidebar.markdown("---")
-    if dl_state["running"]:
-        st.sidebar.markdown("**📥 Descarga en Progreso**")
-    else:
-        st.sidebar.markdown("**✅ Descarga Finalizada**")
-    if dl_state["total"] > 0:
-        st.sidebar.progress(dl_state["progress"])
-        completed = int(dl_state["progress"] * dl_state["total"])
-        caption_text = f"{completed}/{dl_state['total']} canciones"
-        if dl_state["running"] and dl_state["current_track"]:
-            caption_text += f"\n{dl_state['current_track']}"
-        st.sidebar.caption(caption_text)
-    if dl_state["running"] and menu_selection == "dashboard":
-        time.sleep(0.8)
-        st.rerun()
-
 st.markdown("---")
 
 if menu_selection == "dashboard":
+    render_download_monitor(show_main=False)
     st.subheader("Estadísticas de tu Colección")
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("🎵 Total Canciones", len(df))
@@ -1315,136 +1448,4 @@ elif menu_selection == "downloads":
             st.toast(f"🚀 Descarga iniciada con {max_workers} hilo(s). Puedes navegar libremente.", icon="🎵")
             st.rerun()
 
-    dl_state = st.session_state["download_state"]
-    if dl_state["running"] or (dl_state["done"] and dl_state["total"] > 0):
-        st.markdown("#### 📟 Consola en Vivo")
-
-        progress_bar = st.progress(dl_state["progress"])
-        completed = int(dl_state["progress"] * dl_state["total"]) if dl_state["total"] > 0 else 0
-        if dl_state["running"]:
-            status_text = f"Procesando ({completed}/{dl_state['total']}): **{dl_state['current_track']}**"
-        else:
-            status_text = f"✅ Completado: {dl_state['success_count']}/{dl_state['total']} canciones"
-        st.caption(status_text)
-
-        log_lines = dl_state["log_lines"]
-        escaped_lines = (
-            "\n".join(log_lines)
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-        )
-        console_html = f"""
-        <div id="console-wrapper" style="
-            background:#0d1117;
-            border:1px solid #30363d;
-            border-radius:8px;
-            padding:12px 16px;
-            height:320px;
-            overflow-y:auto;
-            font-family:'JetBrains Mono','Fira Code','Courier New',monospace;
-            font-size:12.5px;
-            line-height:1.6;
-            color:#e6edf3;
-            white-space:pre-wrap;
-            word-break:break-all;
-        ">{escaped_lines}</div>
-        """
-        st.html(console_html)
-
-
-        with st.container():
-            st.markdown("#### 📑 Registro de Resultados")
-
-            _filter_col, _spacer = st.columns([2, 5])
-            with _filter_col:
-                log_filter = st.radio(
-                    "Filtrar por estado:",
-                    options=["Errores", "Éxitos", "Omitidos", "Todos"],
-                    index=0,
-                    horizontal=True,
-                    key="log_filter_radio",
-                    label_visibility="collapsed",
-                )
-
-            def _render_log_table(filter_choice: str):
-                _lfp = st.session_state.get("log_file_path", "")
-                if not _lfp or not os.path.exists(_lfp):
-                    st.info("Aún no hay entradas en el registro. Inicia una descarga para comenzar.")
-                    return
-
-                prefix_map = {
-                    "Errores":  "ERROR",
-                    "Éxitos":   "ÉXITO",
-                    "Omitidos": "OMITIDO",
-                    "Todos":    None,
-                }
-                target_prefix = prefix_map.get(filter_choice)
-
-                rows = []
-                try:
-                    with open(_lfp, 'r', encoding='utf-8') as _lf:
-                        for raw_line in _lf:
-                            line = raw_line.strip()
-                            if not line:
-                                continue
-                            parts = [p.strip() for p in line.split('|')]
-                            estado  = parts[0] if len(parts) > 0 else ""
-                            cancion = parts[1] if len(parts) > 1 else ""
-                            detalle = parts[2] if len(parts) > 2 else ""
-                            if target_prefix is None or estado.upper().startswith(target_prefix.upper()):
-                                rows.append({"Estado": estado, "Canción": cancion, "Detalle / Error": detalle})
-                except Exception as _read_err:
-                    st.warning(f"No se pudo leer el registro: {_read_err}")
-                    return
-
-                if not rows:
-                    st.info(f"Sin resultados para el filtro **{filter_choice}**.")
-                    return
-
-                _df_log = pd.DataFrame(rows)
-
-                def _style_estado(val):
-                    color_map = {
-                        "ÉXITO":   "color: #3fb950; font-weight: 600;",
-                        "ERROR":   "color: #f85149; font-weight: 600;",
-                        "OMITIDO": "color: #d29922; font-weight: 600;",
-                    }
-                    for key, style in color_map.items():
-                        if val.upper().startswith(key):
-                            return style
-                    return ""
-
-                styled = _df_log.style.map(_style_estado, subset=["Estado"])
-                st.dataframe(
-                    styled,
-                    use_container_width=True,
-                    hide_index=True,
-                    height=min(400, 35 * len(rows) + 38),
-                )
-                st.caption(
-                    f"📁 Registro guardado en: `{_lfp}` — "
-                    f"{len(rows)} entradas mostradas"
-                )
-
-            _render_log_table(log_filter)
-
-        if dl_state["running"]:
-            time.sleep(1)
-            st.rerun()
-        else:
-            failed_songs = dl_state["failed_songs"]
-            if failed_songs:
-                df_failed = pd.DataFrame(failed_songs)
-                st.error(f"⚠️ {len(failed_songs)} errores detectados.")
-                cols = [c for c in ['Track Name', 'Artist Name(s)', 'Album Name', 'Error_Reason'] if c in df_failed.columns]
-                st.dataframe(df_failed[cols], use_container_width=True, hide_index=True)
-                st.download_button(
-                    "📥 Descargar CSV de Errores",
-                    data=df_failed.to_csv(index=False).encode('utf-8'),
-                    file_name="errores.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.balloons()
-                st.success("✨ ¡Descarga completada sin errores!")
+    render_download_monitor()
