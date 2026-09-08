@@ -22,6 +22,7 @@ from mutagen.id3 import (
     USLT, SYLT, APIC, COMM,
     Encoding
 )
+import youtube_sync
 try:
     from streamlit.runtime.scriptrunner import add_script_run_ctx
 except ImportError:
@@ -166,10 +167,20 @@ def _initialize_music_cleanup_db(connection):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nombre_archivo TEXT NOT NULL,
             carpeta_id INTEGER NOT NULL,
-            FOREIGN KEY (carpeta_id) REFERENCES Carpetas(id)
+            youtube_video_id TEXT,
+            FOREIGN KEY (carpeta_id) REFERENCES Carpetas(id),
+            UNIQUE(nombre_archivo, carpeta_id)
+        );
+        CREATE TABLE IF NOT EXISTS Configuracion (
+            clave TEXT PRIMARY KEY,
+            valor TEXT
         );
         """
     )
+    try:
+        connection.execute("ALTER TABLE Canciones ADD COLUMN youtube_video_id TEXT")
+    except sqlite3.OperationalError:
+        pass
     connection.commit()
 
 
@@ -206,25 +217,43 @@ def _populate_music_cleanup_db(progress_bar):
     completed_entries = 0
     with sqlite3.connect(_MUSIC_CLEANUP_DB) as connection:
         _initialize_music_cleanup_db(connection)
-        connection.execute("DELETE FROM Canciones")
-        connection.execute("DELETE FROM Carpetas")
+        
         folder_ids = {}
         for folder_name in folder_entries:
-            cursor = connection.execute(
-                "INSERT INTO Carpetas (nombre_carpeta) VALUES (?)",
-                (folder_name,),
+            connection.execute(
+                "INSERT OR IGNORE INTO Carpetas (nombre_carpeta) VALUES (?)",
+                (folder_name,)
             )
-            folder_ids[folder_name] = cursor.lastrowid
+            cursor = connection.execute(
+                "SELECT id FROM Carpetas WHERE nombre_carpeta = ?",
+                (folder_name,)
+            )
+            folder_ids[folder_name] = cursor.fetchone()[0]
             completed_entries += 1
             progress_bar.progress(completed_entries / total_entries if total_entries else 1.0)
 
+        valid_pairs = []
         for folder_name, filename in song_entries:
+            c_id = folder_ids[folder_name]
+            valid_pairs.append((c_id, filename))
             connection.execute(
-                "INSERT INTO Canciones (nombre_archivo, carpeta_id) VALUES (?, ?)",
-                (filename, folder_ids[folder_name]),
+                "INSERT OR IGNORE INTO Canciones (nombre_archivo, carpeta_id) VALUES (?, ?)",
+                (filename, c_id)
             )
             completed_entries += 1
             progress_bar.progress(completed_entries / total_entries if total_entries else 1.0)
+            
+        connection.execute("CREATE TEMPORARY TABLE ValidCanciones (carpeta_id INTEGER, nombre_archivo TEXT)")
+        connection.executemany("INSERT INTO ValidCanciones VALUES (?, ?)", valid_pairs)
+        connection.execute("""
+            DELETE FROM Canciones 
+            WHERE NOT EXISTS (
+                SELECT 1 FROM ValidCanciones vc 
+                WHERE vc.carpeta_id = Canciones.carpeta_id AND vc.nombre_archivo = Canciones.nombre_archivo
+            )
+        """)
+        connection.execute("DROP TABLE ValidCanciones")
+
         connection.commit()
 
     return _load_music_cleanup_rows()
@@ -1185,11 +1214,89 @@ with st.expander("💿 Búsqueda de Álbumes"):
         "de discografías y álbumes faltantes."
     )
 
+
+def render_youtube_sync_module():
+    st.subheader("Integración con YouTube Music")
+    tab1, tab2 = st.tabs(["Sincronización Bidireccional", "Crear Playlist desde CSV"])
+    
+    with tab1:
+        st.write("### Paso 1: Emparejar Canciones")
+        st.info("Busca en YouTube los IDs de las canciones locales que aún no están vinculadas.")
+        if st.button("🔍 Buscar IDs en YouTube"):
+            scroll_box = st.container(height=300)
+            log_container = scroll_box.empty()
+            log_text = []
+            def log_cb(msg):
+                log_text.append(msg)
+                if len(log_text) > 100:
+                    log_text.pop(0)
+                log_container.code('\n'.join(log_text), language='bash')
+            
+            with st.spinner("Buscando en YouTube..."):
+                youtube_sync.match_local_songs_to_youtube(_MUSIC_CLEANUP_DB, log_callback=log_cb)
+        
+        st.write("---")
+        st.write("### Paso 2: Sincronizar Playlist")
+        st.write("Sincroniza tu base de datos local con la playlist 'Mis Canciones' en YouTube.")
+        if st.button("🔄 Sincronizar Ahora", type="primary"):
+            scroll_box = st.container(height=300)
+            log_container = scroll_box.empty()
+            log_text = []
+            def log_cb(msg):
+                log_text.append(msg)
+                if len(log_text) > 100:  # Aumentamos el límite ya que ahora hay scroll
+                    log_text.pop(0)
+                log_container.code('\n'.join(log_text), language='bash')
+            
+            success = youtube_sync.sync_mis_canciones(_MUSIC_CLEANUP_DB, log_callback=log_cb)
+            if success:
+                st.success("Sincronización completada con éxito.")
+            else:
+                st.error("Sincronización finalizada con errores (revisa los logs).")
+                    
+    with tab2:
+        st.write("Crea una nueva playlist en YouTube a partir de un archivo CSV.")
+        csv_file = st.file_uploader("Sube el CSV (los IDs de YouTube deben estar en la primera columna)", type=["csv"], key="csv_yt")
+        playlist_name = st.text_input("Nombre de la Playlist (Opcional)", placeholder="Dejar en blanco para autogenerar")
+        
+        if csv_file and st.button("Crear Playlist"):
+            scroll_box = st.container(height=300)
+            log_container = scroll_box.empty()
+            log_text = []
+            def log_cb(msg):
+                log_text.append(msg)
+                if len(log_text) > 100:  # Aumentamos el límite ya que ahora hay scroll
+                    log_text.pop(0)
+                log_container.code('\n'.join(log_text), language='bash')
+            
+            temp_path = "temp_yt_upload.csv"
+            with open(temp_path, "wb") as f:
+                f.write(csv_file.getbuffer())
+            
+            success, errores = youtube_sync.create_playlist_from_csv(temp_path, playlist_name, log_callback=log_cb)
+            if success:
+                st.success("Playlist creada con éxito.")
+            else:
+                st.error("Error al crear la playlist.")
+                
+            if errores:
+                st.warning(f"Se encontraron {len(errores)} canciones que no se pudieron añadir.")
+                df_errores = pd.DataFrame(errores)
+                csv_buffer = io.StringIO()
+                df_errores.to_csv(csv_buffer, index=False)
+                st.download_button(
+                    label="⬇️ Descargar Reporte de Errores",
+                    data=csv_buffer.getvalue(),
+                    file_name="canciones_no_agregadas.csv",
+                    mime="text/csv"
+                )
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
 with st.expander("▶️ Crear playlist en YouTube"):
-    st.info(
-        "🚧 Módulo en construcción: Próximamente se implementará la creación "
-        "automática de la playlist en YouTube Music."
-    )
+    render_youtube_sync_module()
 
 if uploaded_file is None:
     st.info("👈 Por favor, sube tu archivo `.csv` en el menú lateral para cargar la aplicación.")
@@ -1212,6 +1319,8 @@ if st.sidebar.button("📊 Dashboard de Biblioteca", use_container_width=True):
     st.session_state["active_view"] = "dashboard"
 if st.sidebar.button("📥 Descargar Músicas", use_container_width=True):
     st.session_state["active_view"] = "downloads"
+if st.sidebar.button("▶️ YouTube Sync", use_container_width=True):
+    st.session_state["active_view"] = "youtube"
 
 menu_selection = st.session_state["active_view"]
 

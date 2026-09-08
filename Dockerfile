@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 RUN pip install --no-cache-dir --no-deps "spotdl>=4.5.2"
 
 # ── Código fuente ─────────────────────────────────────────────
-COPY app.py .
+COPY *.py .
 
 EXPOSE 8501
 
