@@ -175,6 +175,14 @@ def _initialize_music_cleanup_db(connection):
             clave TEXT PRIMARY KEY,
             valor TEXT
         );
+        CREATE TABLE IF NOT EXISTS Pendientes_YouTube (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            playlist_id TEXT NOT NULL,
+            cancion TEXT NOT NULL,
+            intentos INTEGER DEFAULT 0,
+            ultimo_error TEXT,
+            UNIQUE(playlist_id, cancion)
+        );
         """
     )
     try:
@@ -1198,11 +1206,276 @@ def render_download_monitor(show_main=True):
 if os.path.exists(LOGO_PATH):
     st.sidebar.image(LOGO_PATH, use_container_width=True)
 
-st.sidebar.title("Configuración Inicial")
-uploaded_file = st.sidebar.file_uploader("📂 Sube tu archivo CSV de Spotify", type=["csv"])
+# --- MÓDULO DESCARGAS ---
+def render_csv_download_module():
+    with st.expander("📥 Descargar Musicas desde CSV(Spotify)"):
+        st.title("Configuración Inicial")
+        uploaded_file = st.file_uploader("📂 Sube tu archivo CSV de Spotify", type=["csv"])
 
+        if uploaded_file is None:
+            st.info("👈 Por favor, sube tu archivo `.csv` en el menú lateral para cargar la aplicación.")
+            return
+        
+        try:
+            df_raw = pd.read_csv(uploaded_file)
+            df = process_dataframe(df_raw)
+        except Exception as e:
+            st.error(f"Error al procesar el archivo: {e}")
+            return
+        
+        st.subheader("Descargador y Organizador")
+    
+        col_conf1, col_conf2 = st.columns([1, 1])
+    
+        with col_conf1:
+            host_dir_visual = os.getenv("HOST_MUSIC_DIR", "Ruta_Windows_No_Definida")
+            st.text_input(
+                "📂 Ruta Base de Descarga:",
+                value=host_dir_visual,
+                help="Carpeta raíz donde se guardarán los MP3 (Ruta en tu máquina local).",
+                disabled=True
+            )
+            download_base_path = "/app/output"
+            st.session_state["download_base_path"] = download_base_path
+    
+            custom_root_folder = st.text_input("📁 Carpeta Raíz (subcarpeta):", value="Mi Musica")
+            engine_mode = st.selectbox(
+                "Estrategia de Motores:",
+                ["Solo yt-dlp (Recomendado y rápido)", "Cascada Automática (spotdl ➔ yt-dlp)", "Solo spotdl"],
+                disabled=True
+            )
+    
+            max_workers = st.selectbox(
+                "🧵 Hilos de descarga simultáneos", 
+                options=[1, 2, 3, 4, 5], 
+                index=1
+            )
+    
+            spotipy_client_id = ""
+            spotipy_client_secret = ""
+    
+            if "spotdl" in engine_mode:
+                st.warning("Para usar spotdl necesitas tus credenciales de Spotify for Developers.")
+                spotipy_client_id = st.text_input("Client ID", type="password")
+                spotipy_client_secret = st.text_input("Client Secret", type="password")
+    
+        with col_conf2:
+            _effective_base = st.session_state["download_base_path"]
+            host_dir_visual = os.getenv("HOST_MUSIC_DIR", "Ruta_Windows_No_Definida")
+            st.write("📌 **Reglas de guardado (Preview):**")
+            st.write(f"- Ruta: `{host_dir_visual}/{sanitize_name(custom_root_folder)}/{{ArtistaPrincipal}}/`")
+            if _effective_base.rstrip("/") == "/app/output":
+                st.info("📁 Ruta interna: /app/output/... (Mapeado a tu carpeta local de Música a través de Docker)")
+            st.write("- Archivo: `NombreCancion, Album, Artista.mp3`")
+    
+            download_running = st.session_state["download_state"]["running"]
+            btn_col1, btn_col2 = st.columns([3, 1])
+            with btn_col1:
+                if download_running:
+                    _btn_label = "⏳ Descarga en Curso..."
+                elif st.session_state["download_state"]["done"]:
+                    _btn_label = "▶️ Iniciar / Reanudar Descarga"
+                else:
+                    _btn_label = "🚀 Iniciar / Reanudar Descarga"
+                start_download = st.button(
+                    _btn_label,
+                    type="primary",
+                    use_container_width=True,
+                    disabled=download_running
+                )
+            with btn_col2:
+                cancel_download = st.button(
+                    "🛑 Cancelar Descarga",
+                    use_container_width=True,
+                    disabled=not download_running,
+                    type="secondary",
+                )
+                if cancel_download:
+                    st.session_state["download_control"].request_cancel()
+                    st.toast("🛑 Cancelación solicitada. El proceso se detendrá tras la pista actual.", icon="🛑")
+    
+        if start_download:
+            if "spotdl" in engine_mode and (not spotipy_client_id or not spotipy_client_secret):
+                st.error("⚠️ Debes ingresar tu Client ID y Client Secret de Spotify para poder usar esta estrategia.")
+            else:
+                cancel_ctrl = st.session_state["download_control"]
+                cancel_ctrl.reset()
+    
+                effective_base = st.session_state["download_base_path"]
+                os.makedirs(effective_base, exist_ok=True)
+                log_file_path = os.path.join(effective_base, "registro_descargas.txt")
+    
+                _resume_msg = "REANUDADO | Retomando proceso de descarga..."
+                st.session_state["download_state"]["log_lines"].insert(0, f"\n▶️ {_resume_msg}")
+                try:
+                    with open(log_file_path, 'a', encoding='utf-8') as _lf:
+                        _lf.write(f"{_resume_msg}\n")
+                except Exception:
+                    pass
+    
+                df_sorted = df.sort_values(by=['Clean_Primary_Artist', 'Track Name']).reset_index(drop=True)
+                root_target_dir = os.path.join(effective_base, sanitize_name(custom_root_folder))
+                os.makedirs(root_target_dir, exist_ok=True)
+    
+                st.session_state["log_file_path"] = log_file_path
+    
+                env_vars = os.environ.copy()
+                if "spotdl" in engine_mode:
+                    env_vars["SPOTIPY_CLIENT_ID"] = spotipy_client_id
+                    env_vars["SPOTIPY_CLIENT_SECRET"] = spotipy_client_secret
+    
+                job_thread = threading.Thread(
+                    target=run_download_job,
+                    args=(df_sorted, root_target_dir, log_file_path, engine_mode, env_vars, cancel_ctrl, max_workers),
+                    daemon=True,
+                )
+                # Inyectar contexto de Streamlit al hilo orquestador
+                if add_script_run_ctx is not None:
+                    add_script_run_ctx(job_thread)
+    
+                job_thread.start()
+                st.toast(f"🚀 Descarga iniciada con {max_workers} hilo(s). Puedes navegar libremente.", icon="🎵")
+                st.rerun()
+    
+        render_download_monitor()
+
+
+# --- MÓDULO DASHBOARD ---
+def render_dashboard_module():
+    with st.expander("📊 Dashboard de Biblioteca"):
+        st.title("Configuración Inicial del Dashboard")
+        dashboard_file = st.file_uploader("📂 Sube tu archivo CSV de Spotify para analizar", type=["csv"], key="dashboard_uploader")
+        if dashboard_file is None:
+            st.info("👈 Por favor, sube tu archivo `.csv` para ver el Dashboard.")
+            return
+        try:
+            df_raw = pd.read_csv(dashboard_file)
+            df = process_dataframe(df_raw)
+        except Exception as e:
+            st.error(f"Error al procesar el archivo: {e}")
+            return
+        render_download_monitor(show_main=False)
+        st.subheader("Estadísticas de tu Colección")
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
+        col1.metric("🎵 Total Canciones", len(df))
+        if 'Clean_Primary_Artist' in df.columns:
+            col2.metric("🎤 Artistas", df['Clean_Primary_Artist'].nunique())
+        if 'Album Name' in df.columns:
+            col3.metric("💿 Álbumes", df['Album Name'].nunique())
+        if 'Duration_Min' in df.columns:
+            col4.metric("⏱ Horas", f"{df['Duration_Min'].sum() / 60:.1f} h")
+        if 'Popularity' in df.columns:
+            col5.metric("⭐ Popularidad Media", f"{df['Popularity'].mean():.0f}/100")
+        if 'Explicit' in df.columns:
+            explicit_pct = df['Explicit'].sum() / len(df) * 100
+            col6.metric("🔞 Explícitas", f"{explicit_pct:.1f}%")
+    
+        st.markdown("<br>", unsafe_allow_html=True)
+        row1_col1, row1_col2 = st.columns(2)
+        with row1_col1:
+            if 'Clean_Primary_Artist' in df.columns:
+                st.markdown("**Top 10 Artistas Más Guardados**")
+                top_artists = df['Clean_Primary_Artist'].value_counts().head(10).reset_index()
+                top_artists.columns = ['Artista', 'Canciones']
+                fig_art = px.bar(
+                    top_artists, x='Canciones', y='Artista', orientation='h',
+                    color='Canciones', color_continuous_scale='Greens'
+                )
+                fig_art.update_layout(
+                    yaxis={'categoryorder': 'total ascending'},
+                    margin=dict(l=0, r=0, t=0, b=0)
+                )
+                st.plotly_chart(fig_art, use_container_width=True)
+    
+        with row1_col2:
+            if 'Release Year' in df.columns:
+                st.markdown("**Distribución por Año de Lanzamiento**")
+                fig_year = px.histogram(
+                    df, x='Release Year', nbins=30,
+                    color_discrete_sequence=['#1DB954']
+                )
+                fig_year.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+                st.plotly_chart(fig_year, use_container_width=True)
+    
+        row2_col1, row2_col2 = st.columns(2)
+        with row2_col1:
+            if 'Energy' in df.columns and 'Valence' in df.columns:
+                st.markdown("**Energy vs Valence**")
+                scatter_df = df[['Energy', 'Valence', 'Track Name', 'Clean_Primary_Artist']].dropna(
+                    subset=['Energy', 'Valence']
+                )
+                fig_scatter = px.scatter(
+                    scatter_df,
+                    x='Energy', y='Valence',
+                    hover_name='Track Name',
+                    hover_data={'Clean_Primary_Artist': True, 'Energy': ':.2f', 'Valence': ':.2f'},
+                    color='Valence',
+                    color_continuous_scale='RdYlGn',
+                    opacity=0.7,
+                    labels={'Clean_Primary_Artist': 'Artista'}
+                )
+                fig_scatter.update_layout(
+                    xaxis_title="Energía",
+                    yaxis_title="Valencia (positividad)",
+                    margin=dict(l=0, r=0, t=0, b=0)
+                )
+                st.plotly_chart(fig_scatter, use_container_width=True)
+    
+        with row2_col2:
+            if 'Genres' in df.columns:
+                st.markdown("**Géneros Más Escuchados**")
+                genres_series = (
+                    df['Genres'].dropna()
+                    .astype(str)
+                    .str.split(',')
+                    .explode()
+                    .str.strip()
+                    .replace('', pd.NA)
+                    .dropna()
+                )
+                if len(genres_series) > 0:
+                    top_genres = genres_series.value_counts().head(15).reset_index()
+                    top_genres.columns = ['Género', 'Canciones']
+                    fig_genres = px.bar(
+                        top_genres, x='Canciones', y='Género', orientation='h',
+                        color='Canciones', color_continuous_scale='Blues'
+                    )
+                    fig_genres.update_layout(
+                        yaxis={'categoryorder': 'total ascending'},
+                        margin=dict(l=0, r=0, t=0, b=0)
+                    )
+                    st.plotly_chart(fig_genres, use_container_width=True)
+                else:
+                    st.info("No se encontraron datos de géneros en el CSV.")
+    
+        if 'Popularity' in df.columns:
+            st.markdown("**🏆 Canciones Más Populares**")
+            pop_cols = [c for c in [
+                'Track Name', 'Artist Name(s)', 'Album Name',
+                'Popularity', 'Danceability', 'Energy', 'Valence', 'Tempo', 'Explicit'
+            ] if c in df.columns]
+            top_songs = (
+                df[pop_cols]
+                .dropna(subset=['Popularity'])
+                .sort_values('Popularity', ascending=False)
+                .head(20)
+            )
+            st.dataframe(top_songs, use_container_width=True, hide_index=True)
+        else:
+            st.markdown("**Vista Previa de Datos**")
+            display_cols = [c for c in [
+                'Track Name', 'Artist Name(s)', 'Album Name', 'Release Year'
+            ] if c in df.columns]
+            st.dataframe(df[display_cols].head(100), use_container_width=True, hide_index=True)
+    
+    
 st.title("Sello de Gato Music")
 st.markdown("---")
+# --- NUEVO MÓDULO CSV ---
+render_csv_download_module()
+render_dashboard_module()
+
+
 try:
     render_music_cleanup_module()
 except (OSError, sqlite3.Error) as error:
@@ -1295,266 +1568,45 @@ def render_youtube_sync_module():
             except OSError:
                 pass
 
+        st.write("---")
+        st.write("### Cola de Procesamiento Activa")
+        
+        playlist_id_actual = st.text_input("ID de la Playlist (Para monitorear o reanudar cola)", placeholder="Ej: PLxxxxxx...")
+        
+        if playlist_id_actual:
+            with sqlite3.connect(_MUSIC_CLEANUP_DB) as conn:
+                df_cola = pd.read_sql_query(
+                    "SELECT cancion, intentos, ultimo_error FROM Pendientes_YouTube WHERE playlist_id = ?", 
+                    conn, 
+                    params=(playlist_id_actual,)
+                )
+            
+            if not df_cola.empty:
+                st.dataframe(df_cola, height=300, use_container_width=True)
+                
+                if st.button("▶️ Continuar Procesamiento (Reanudar Cola)"):
+                    scroll_box = st.container(height=300)
+                    log_container = scroll_box.empty()
+                    log_text = []
+                    
+                    def log_cb(msg):
+                        log_text.append(msg)
+                        if len(log_text) > 50:
+                            log_text.pop(0)
+                        log_container.code('\n'.join(log_text), language='bash')
+                    
+                    with st.spinner("Procesando canciones en la cola..."):
+                        resultado = youtube_sync.procesar_cola_youtube(playlist_id_actual, _MUSIC_CLEANUP_DB, log_callback=log_cb)
+                        
+                        if resultado:
+                            st.success("Procesamiento completado.")
+                            st.rerun()
+                        else:
+                            st.error("El procesamiento se detuvo (Posible error de cuota).")
+                            
+            else:
+                st.success("La cola está vacía. Todas las canciones han sido procesadas.")
+
 with st.expander("▶️ Crear playlist en YouTube"):
     render_youtube_sync_module()
 
-if uploaded_file is None:
-    st.info("👈 Por favor, sube tu archivo `.csv` en el menú lateral para cargar la aplicación.")
-    st.stop()
-
-try:
-    df_raw = pd.read_csv(uploaded_file)
-    df = process_dataframe(df_raw)
-except Exception as e:
-    st.error(f"Error al procesar el archivo: {e}")
-    st.stop()
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Navegación")
-
-if "active_view" not in st.session_state:
-    st.session_state["active_view"] = "dashboard"
-
-if st.sidebar.button("📊 Dashboard de Biblioteca", use_container_width=True):
-    st.session_state["active_view"] = "dashboard"
-if st.sidebar.button("📥 Descargar Músicas", use_container_width=True):
-    st.session_state["active_view"] = "downloads"
-if st.sidebar.button("▶️ YouTube Sync", use_container_width=True):
-    st.session_state["active_view"] = "youtube"
-
-menu_selection = st.session_state["active_view"]
-
-st.markdown("---")
-
-if menu_selection == "dashboard":
-    render_download_monitor(show_main=False)
-    st.subheader("Estadísticas de tu Colección")
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    col1.metric("🎵 Total Canciones", len(df))
-    if 'Clean_Primary_Artist' in df.columns:
-        col2.metric("🎤 Artistas", df['Clean_Primary_Artist'].nunique())
-    if 'Album Name' in df.columns:
-        col3.metric("💿 Álbumes", df['Album Name'].nunique())
-    if 'Duration_Min' in df.columns:
-        col4.metric("⏱ Horas", f"{df['Duration_Min'].sum() / 60:.1f} h")
-    if 'Popularity' in df.columns:
-        col5.metric("⭐ Popularidad Media", f"{df['Popularity'].mean():.0f}/100")
-    if 'Explicit' in df.columns:
-        explicit_pct = df['Explicit'].sum() / len(df) * 100
-        col6.metric("🔞 Explícitas", f"{explicit_pct:.1f}%")
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    row1_col1, row1_col2 = st.columns(2)
-    with row1_col1:
-        if 'Clean_Primary_Artist' in df.columns:
-            st.markdown("**Top 10 Artistas Más Guardados**")
-            top_artists = df['Clean_Primary_Artist'].value_counts().head(10).reset_index()
-            top_artists.columns = ['Artista', 'Canciones']
-            fig_art = px.bar(
-                top_artists, x='Canciones', y='Artista', orientation='h',
-                color='Canciones', color_continuous_scale='Greens'
-            )
-            fig_art.update_layout(
-                yaxis={'categoryorder': 'total ascending'},
-                margin=dict(l=0, r=0, t=0, b=0)
-            )
-            st.plotly_chart(fig_art, use_container_width=True)
-
-    with row1_col2:
-        if 'Release Year' in df.columns:
-            st.markdown("**Distribución por Año de Lanzamiento**")
-            fig_year = px.histogram(
-                df, x='Release Year', nbins=30,
-                color_discrete_sequence=['#1DB954']
-            )
-            fig_year.update_layout(margin=dict(l=0, r=0, t=0, b=0))
-            st.plotly_chart(fig_year, use_container_width=True)
-
-    row2_col1, row2_col2 = st.columns(2)
-    with row2_col1:
-        if 'Energy' in df.columns and 'Valence' in df.columns:
-            st.markdown("**Energy vs Valence**")
-            scatter_df = df[['Energy', 'Valence', 'Track Name', 'Clean_Primary_Artist']].dropna(
-                subset=['Energy', 'Valence']
-            )
-            fig_scatter = px.scatter(
-                scatter_df,
-                x='Energy', y='Valence',
-                hover_name='Track Name',
-                hover_data={'Clean_Primary_Artist': True, 'Energy': ':.2f', 'Valence': ':.2f'},
-                color='Valence',
-                color_continuous_scale='RdYlGn',
-                opacity=0.7,
-                labels={'Clean_Primary_Artist': 'Artista'}
-            )
-            fig_scatter.update_layout(
-                xaxis_title="Energía",
-                yaxis_title="Valencia (positividad)",
-                margin=dict(l=0, r=0, t=0, b=0)
-            )
-            st.plotly_chart(fig_scatter, use_container_width=True)
-
-    with row2_col2:
-        if 'Genres' in df.columns:
-            st.markdown("**Géneros Más Escuchados**")
-            genres_series = (
-                df['Genres'].dropna()
-                .astype(str)
-                .str.split(',')
-                .explode()
-                .str.strip()
-                .replace('', pd.NA)
-                .dropna()
-            )
-            if len(genres_series) > 0:
-                top_genres = genres_series.value_counts().head(15).reset_index()
-                top_genres.columns = ['Género', 'Canciones']
-                fig_genres = px.bar(
-                    top_genres, x='Canciones', y='Género', orientation='h',
-                    color='Canciones', color_continuous_scale='Blues'
-                )
-                fig_genres.update_layout(
-                    yaxis={'categoryorder': 'total ascending'},
-                    margin=dict(l=0, r=0, t=0, b=0)
-                )
-                st.plotly_chart(fig_genres, use_container_width=True)
-            else:
-                st.info("No se encontraron datos de géneros en el CSV.")
-
-    if 'Popularity' in df.columns:
-        st.markdown("**🏆 Canciones Más Populares**")
-        pop_cols = [c for c in [
-            'Track Name', 'Artist Name(s)', 'Album Name',
-            'Popularity', 'Danceability', 'Energy', 'Valence', 'Tempo', 'Explicit'
-        ] if c in df.columns]
-        top_songs = (
-            df[pop_cols]
-            .dropna(subset=['Popularity'])
-            .sort_values('Popularity', ascending=False)
-            .head(20)
-        )
-        st.dataframe(top_songs, use_container_width=True, hide_index=True)
-    else:
-        st.markdown("**Vista Previa de Datos**")
-        display_cols = [c for c in [
-            'Track Name', 'Artist Name(s)', 'Album Name', 'Release Year'
-        ] if c in df.columns]
-        st.dataframe(df[display_cols].head(100), use_container_width=True, hide_index=True)
-
-
-elif menu_selection == "downloads":
-    st.subheader("Descargador y Organizador")
-
-    col_conf1, col_conf2 = st.columns([1, 1])
-
-    with col_conf1:
-        host_dir_visual = os.getenv("HOST_MUSIC_DIR", "Ruta_Windows_No_Definida")
-        st.text_input(
-            "📂 Ruta Base de Descarga:",
-            value=host_dir_visual,
-            help="Carpeta raíz donde se guardarán los MP3 (Ruta en tu máquina local).",
-            disabled=True
-        )
-        download_base_path = "/app/output"
-        st.session_state["download_base_path"] = download_base_path
-
-        custom_root_folder = st.text_input("📁 Carpeta Raíz (subcarpeta):", value="Mi Musica")
-        engine_mode = st.selectbox(
-            "Estrategia de Motores:",
-            ["Solo yt-dlp (Recomendado y rápido)", "Cascada Automática (spotdl ➔ yt-dlp)", "Solo spotdl"],
-            disabled=True
-        )
-
-        max_workers = st.selectbox(
-            "🧵 Hilos de descarga simultáneos", 
-            options=[1, 2, 3, 4, 5], 
-            index=1
-        )
-
-        spotipy_client_id = ""
-        spotipy_client_secret = ""
-
-        if "spotdl" in engine_mode:
-            st.warning("Para usar spotdl necesitas tus credenciales de Spotify for Developers.")
-            spotipy_client_id = st.text_input("Client ID", type="password")
-            spotipy_client_secret = st.text_input("Client Secret", type="password")
-
-    with col_conf2:
-        _effective_base = st.session_state["download_base_path"]
-        host_dir_visual = os.getenv("HOST_MUSIC_DIR", "Ruta_Windows_No_Definida")
-        st.write("📌 **Reglas de guardado (Preview):**")
-        st.write(f"- Ruta: `{host_dir_visual}/{sanitize_name(custom_root_folder)}/{{ArtistaPrincipal}}/`")
-        if _effective_base.rstrip("/") == "/app/output":
-            st.info("📁 Ruta interna: /app/output/... (Mapeado a tu carpeta local de Música a través de Docker)")
-        st.write("- Archivo: `NombreCancion, Album, Artista.mp3`")
-
-        download_running = st.session_state["download_state"]["running"]
-        btn_col1, btn_col2 = st.columns([3, 1])
-        with btn_col1:
-            if download_running:
-                _btn_label = "⏳ Descarga en Curso..."
-            elif st.session_state["download_state"]["done"]:
-                _btn_label = "▶️ Iniciar / Reanudar Descarga"
-            else:
-                _btn_label = "🚀 Iniciar / Reanudar Descarga"
-            start_download = st.button(
-                _btn_label,
-                type="primary",
-                use_container_width=True,
-                disabled=download_running
-            )
-        with btn_col2:
-            cancel_download = st.button(
-                "🛑 Cancelar Descarga",
-                use_container_width=True,
-                disabled=not download_running,
-                type="secondary",
-            )
-            if cancel_download:
-                st.session_state["download_control"].request_cancel()
-                st.toast("🛑 Cancelación solicitada. El proceso se detendrá tras la pista actual.", icon="🛑")
-
-    if start_download:
-        if "spotdl" in engine_mode and (not spotipy_client_id or not spotipy_client_secret):
-            st.error("⚠️ Debes ingresar tu Client ID y Client Secret de Spotify para poder usar esta estrategia.")
-        else:
-            cancel_ctrl = st.session_state["download_control"]
-            cancel_ctrl.reset()
-
-            effective_base = st.session_state["download_base_path"]
-            os.makedirs(effective_base, exist_ok=True)
-            log_file_path = os.path.join(effective_base, "registro_descargas.txt")
-
-            _resume_msg = "REANUDADO | Retomando proceso de descarga..."
-            st.session_state["download_state"]["log_lines"].insert(0, f"\n▶️ {_resume_msg}")
-            try:
-                with open(log_file_path, 'a', encoding='utf-8') as _lf:
-                    _lf.write(f"{_resume_msg}\n")
-            except Exception:
-                pass
-
-            df_sorted = df.sort_values(by=['Clean_Primary_Artist', 'Track Name']).reset_index(drop=True)
-            root_target_dir = os.path.join(effective_base, sanitize_name(custom_root_folder))
-            os.makedirs(root_target_dir, exist_ok=True)
-
-            st.session_state["log_file_path"] = log_file_path
-
-            env_vars = os.environ.copy()
-            if "spotdl" in engine_mode:
-                env_vars["SPOTIPY_CLIENT_ID"] = spotipy_client_id
-                env_vars["SPOTIPY_CLIENT_SECRET"] = spotipy_client_secret
-
-            job_thread = threading.Thread(
-                target=run_download_job,
-                args=(df_sorted, root_target_dir, log_file_path, engine_mode, env_vars, cancel_ctrl, max_workers),
-                daemon=True,
-            )
-            # Inyectar contexto de Streamlit al hilo orquestador
-            if add_script_run_ctx is not None:
-                add_script_run_ctx(job_thread)
-
-            job_thread.start()
-            st.toast(f"🚀 Descarga iniciada con {max_workers} hilo(s). Puedes navegar libremente.", icon="🎵")
-            st.rerun()
-
-    render_download_monitor()

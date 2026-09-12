@@ -1,4 +1,5 @@
 import os
+import pandas as pd
 import time
 import logging
 import sqlite3
@@ -29,16 +30,32 @@ def get_youtube_service():
 
     creds = None
     token_path = os.path.join('data', 'token.json')
+    
+    # Crear carpeta data si no existe
+    os.makedirs('data', exist_ok=True)
+    
     if os.path.exists(token_path):
         creds = Credentials.from_authorized_user_file(token_path, SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            with open(token_path, 'w') as token_file:
-                token_file.write(creds.to_json())
         else:
-            raise Exception("Falta el archivo token.json en la carpeta data/. Genéralo en Windows y muévelo allí.")
+            client_config = {
+                "installed": {
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                    "redirect_uris": ["http://localhost"]
+                }
+            }
+            flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+            creds = flow.run_local_server(port=0)
+            
+        with open(token_path, 'w') as token_file:
+            token_file.write(creds.to_json())
 
     return build('youtube', 'v3', credentials=creds)
 
@@ -407,3 +424,91 @@ def match_local_songs_to_youtube(db_path, log_callback=None):
                 
     log_callback("Proceso de emparejamiento finalizado.")
     return True
+
+def ingestar_csv_a_cola(csv_path, playlist_id, db_path):
+    """
+    Fase 2: Lee el CSV de Spotify y puebla la tabla Pendientes_YouTube evitando duplicados.
+    """
+    df = pd.read_csv(csv_path)
+    
+    # Validamos que sea el formato esperado (Spotify)
+    if 'Track Name' in df.columns and 'Artist Name(s)' in df.columns:
+        # Concatenar y limpiar
+        df['cancion'] = df['Track Name'].astype(str).str.strip() + ' - ' + df['Artist Name(s)'].astype(str).str.strip()
+        df = df.drop_duplicates(subset=['cancion'])
+        
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            for cancion in df['cancion'].tolist():
+                if cancion.strip():
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO Pendientes_YouTube (playlist_id, cancion) VALUES (?, ?)", 
+                        (playlist_id, cancion)
+                    )
+            conn.commit()
+        return True
+    return False
+
+def procesar_cola_youtube(playlist_id, db_path, log_callback):
+    """
+    Fase 2: Procesa la tabla Pendientes_YouTube, respeta cuotas y actualiza estados de error.
+    """
+    youtube = get_youtube_service()
+    
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, cancion, intentos FROM Pendientes_YouTube WHERE playlist_id = ?", (playlist_id,))
+        pendientes = cursor.fetchall()
+        
+        for id_bd, cancion, intentos in pendientes:
+            try:
+                # 1. Buscar en YouTube
+                search_response = youtube.search().list(
+                    q=cancion, part="id", maxResults=1, type="video"
+                ).execute()
+                
+                items = search_response.get("items", [])
+                if items:
+                    video_id = items[0]["id"]["videoId"]
+                    
+                    # 2. Insertar en la playlist
+                    youtube.playlistItems().insert(
+                        part="snippet",
+                        body={
+                            "snippet": {
+                                "playlistId": playlist_id,
+                                "resourceId": {
+                                    "kind": "youtube#video",
+                                    "videoId": video_id
+                                }
+                            }
+                        }
+                    ).execute()
+                    
+                    # Éxito: Eliminar de pendientes
+                    cursor.execute("DELETE FROM Pendientes_YouTube WHERE id = ?", (id_bd,))
+                    conn.commit()
+                    log_callback(f"✔ AGREGADA: {cancion}")
+                else:
+                    # No encontrado
+                    cursor.execute("UPDATE Pendientes_YouTube SET intentos = intentos + 1, ultimo_error = ? WHERE id = ?", ("Video no encontrado", id_bd))
+                    conn.commit()
+                    log_callback(f"⚠ NO ENCONTRADA: {cancion}")
+                
+                time.sleep(2)  # Pausa requerida entre iteraciones
+                
+            except HttpError as e:
+                # Manejar error HTTP
+                error_msg = str(e)
+                cursor.execute("UPDATE Pendientes_YouTube SET intentos = intentos + 1, ultimo_error = ? WHERE id = ?", (error_msg, id_bd))
+                conn.commit()
+                
+                # CRÍTICO: Control de Cuota
+                if 'quotaExceeded' in error_msg or 'rateLimitExceeded' in error_msg:
+                    log_callback("❌ ERROR CRÍTICO: Cuota diaria excedida (HTTP 403) o Límite de Peticiones. Deteniendo ejecución.")
+                    return False
+                else:
+                    log_callback(f"✖ ERROR en {cancion}: {error_msg}")
+                    time.sleep(2)
+                    
+        return True
