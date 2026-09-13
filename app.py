@@ -1340,6 +1340,181 @@ def render_csv_download_module():
         render_download_monitor()
 
 
+# --- MÓDULO YOUTUBE PLAYLIST ---
+def render_youtube_playlist_download_module():
+    with st.expander("📥 Descargar Musicas desde playlist(Youtube)"):
+        st.title("Configuración Inicial")
+        yt_playlist_url = st.text_input("🔗 Ingresa el link de la Playlist de YouTube", key="yt_playlist_url")
+
+        if not yt_playlist_url:
+            st.info("👈 Por favor, ingresa el link de la Playlist de YouTube para cargar la aplicación.")
+            return
+        
+        st.subheader("Descargador y Organizador")
+    
+        col_conf1, col_conf2 = st.columns([1, 1])
+    
+        with col_conf1:
+            host_dir_visual = os.getenv("HOST_MUSIC_DIR", "Ruta_Windows_No_Definida")
+            st.text_input(
+                "📂 Ruta Base de Descarga:",
+                value=host_dir_visual,
+                help="Carpeta raíz donde se guardarán los MP3 (Ruta en tu máquina local).",
+                disabled=True,
+                key="base_dir_yt"
+            )
+            download_base_path = "/app/output"
+            st.session_state["download_base_path"] = download_base_path
+    
+            custom_root_folder = st.text_input("📁 Carpeta Raíz (subcarpeta):", value="Mi Musica", key="custom_root_folder_yt")
+            engine_mode = st.selectbox(
+                "Estrategia de Motores:",
+                ["Solo yt-dlp (Recomendado y rápido)", "Cascada Automática (spotdl ➔ yt-dlp)", "Solo spotdl"],
+                disabled=True,
+                key="engine_mode_yt"
+            )
+    
+            max_workers = st.selectbox(
+                "🧵 Hilos de descarga simultáneos", 
+                options=[1, 2, 3, 4, 5], 
+                index=1,
+                key="max_workers_yt"
+            )
+    
+            spotipy_client_id = ""
+            spotipy_client_secret = ""
+    
+            if "spotdl" in engine_mode:
+                st.warning("Para usar spotdl necesitas tus credenciales de Spotify for Developers.")
+                spotipy_client_id = st.text_input("Client ID", type="password", key="spotipy_client_id_yt")
+                spotipy_client_secret = st.text_input("Client Secret", type="password", key="spotipy_client_secret_yt")
+    
+        with col_conf2:
+            _effective_base = st.session_state["download_base_path"]
+            host_dir_visual = os.getenv("HOST_MUSIC_DIR", "Ruta_Windows_No_Definida")
+            st.write("📌 **Reglas de guardado (Preview):**")
+            st.write(f"- Ruta: `{host_dir_visual}/{sanitize_name(custom_root_folder)}/{{ArtistaPrincipal}}/`")
+            if _effective_base.rstrip("/") == "/app/output":
+                st.info("📁 Ruta interna: /app/output/... (Mapeado a tu carpeta local de Música a través de Docker)")
+            st.write("- Archivo: `NombreCancion, Album, Artista.mp3`")
+    
+            download_running = st.session_state["download_state"]["running"]
+            btn_col1, btn_col2 = st.columns([3, 1])
+            with btn_col1:
+                if download_running:
+                    _btn_label = "⏳ Descarga en Curso..."
+                elif st.session_state["download_state"]["done"]:
+                    _btn_label = "▶️ Iniciar / Reanudar Descarga"
+                else:
+                    _btn_label = "🚀 Descargar Playlist"
+                start_download = st.button(
+                    _btn_label,
+                    key="btn_descargar_yt",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=download_running
+                )
+            with btn_col2:
+                cancel_download = st.button(
+                    "🛑 Cancelar Descarga",
+                    use_container_width=True,
+                    disabled=not download_running,
+                    type="secondary",
+                    key="cancel_download_yt"
+                )
+                if cancel_download:
+                    st.session_state["download_control"].request_cancel()
+                    st.toast("🛑 Cancelación solicitada. El proceso se detendrá tras la pista actual.", icon="🛑")
+    
+        if start_download:
+            if "spotdl" in engine_mode and (not spotipy_client_id or not spotipy_client_secret):
+                st.error("⚠️ Debes ingresar tu Client ID y Client Secret de Spotify para poder usar esta estrategia.")
+            else:
+                import yt_dlp
+                with st.spinner("Extrayendo información de la playlist..."):
+                    ydl_opts = {
+                        'quiet': True,
+                        'extract_flat': True,
+                        'force_generic_extractor': False,
+                    }
+                    data = []
+                    try:
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            info = ydl.extract_info(yt_playlist_url, download=False)
+                            if info and 'entries' in info:
+                                playlist_title = info.get('title', 'YouTube Playlist')
+                                for e in info['entries']:
+                                    if not e: continue
+                                    dur_ms = e.get('duration', 0) * 1000 if e.get('duration') else None
+                                    data.append({
+                                        'Track Name': e.get('title', 'Unknown'),
+                                        'Artist Name(s)': e.get('uploader', 'Unknown'),
+                                        'Clean_Primary_Artist': get_primary_artist(e.get('uploader', 'Unknown')),
+                                        'Album Name': playlist_title,
+                                        'Track URI': f"https://www.youtube.com/watch?v={e.get('id')}",
+                                        'Duration (ms)': dur_ms
+                                    })
+                            elif info:
+                                dur_ms = info.get('duration', 0) * 1000 if info.get('duration') else None
+                                data.append({
+                                    'Track Name': info.get('title', 'Unknown'),
+                                    'Artist Name(s)': info.get('uploader', 'Unknown'),
+                                    'Clean_Primary_Artist': get_primary_artist(info.get('uploader', 'Unknown')),
+                                    'Album Name': 'YouTube Video',
+                                    'Track URI': f"https://www.youtube.com/watch?v={info.get('id')}",
+                                    'Duration (ms)': dur_ms
+                                })
+                    except Exception as e:
+                        st.error(f"Error extrayendo la playlist: {e}")
+                        return
+                
+                if not data:
+                    st.error("No se encontraron videos en la URL proporcionada.")
+                    return
+                    
+                df = pd.DataFrame(data)
+                
+                cancel_ctrl = st.session_state["download_control"]
+                cancel_ctrl.reset()
+    
+                effective_base = st.session_state["download_base_path"]
+                os.makedirs(effective_base, exist_ok=True)
+                log_file_path = os.path.join(effective_base, "registro_descargas_yt.txt")
+    
+                _resume_msg = "REANUDADO | Retomando proceso de descarga..."
+                st.session_state["download_state"]["log_lines"].insert(0, f"\n▶️ {_resume_msg}")
+                try:
+                    with open(log_file_path, 'a', encoding='utf-8') as _lf:
+                        _lf.write(f"{_resume_msg}\n")
+                except Exception:
+                    pass
+    
+                df_sorted = df.sort_values(by=['Clean_Primary_Artist', 'Track Name']).reset_index(drop=True)
+                root_target_dir = os.path.join(effective_base, sanitize_name(custom_root_folder))
+                os.makedirs(root_target_dir, exist_ok=True)
+    
+                st.session_state["log_file_path"] = log_file_path
+    
+                env_vars = os.environ.copy()
+                if "spotdl" in engine_mode:
+                    env_vars["SPOTIPY_CLIENT_ID"] = spotipy_client_id
+                    env_vars["SPOTIPY_CLIENT_SECRET"] = spotipy_client_secret
+    
+                job_thread = threading.Thread(
+                    target=run_download_job,
+                    args=(df_sorted, root_target_dir, log_file_path, engine_mode, env_vars, cancel_ctrl, max_workers),
+                    daemon=True,
+                )
+                if add_script_run_ctx is not None:
+                    add_script_run_ctx(job_thread)
+    
+                job_thread.start()
+                st.toast(f"🚀 Descarga iniciada con {max_workers} hilo(s). Puedes navegar libremente.", icon="🎵")
+                st.rerun()
+    
+        render_download_monitor()
+
+
 # --- MÓDULO DASHBOARD ---
 def render_dashboard_module():
     with st.expander("📊 Dashboard de Biblioteca"):
@@ -1473,6 +1648,7 @@ st.title("Sello de Gato Music")
 st.markdown("---")
 # --- NUEVO MÓDULO CSV ---
 render_csv_download_module()
+render_youtube_playlist_download_module()
 render_dashboard_module()
 
 
